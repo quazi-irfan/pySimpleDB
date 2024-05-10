@@ -1,3 +1,7 @@
+# each interactino with db is a transaction
+# concurrency manager interleaves the regulation of transactions from different clients
+# recovery manager write record of those transactions in a log so uncommited transactions can be recovered
+
 import os
 
 class Block:
@@ -42,9 +46,13 @@ class Page:
     def getInt(self, start):
         return int.from_bytes(self.bb[start : start+4], 'big')
 
+    def getByte(self, start):
+        byte_len = self.getInt(start)
+        return self.bb[start+4 : start+4+byte_len]
+
 
 class FileMgr:
-    def __init__(self, db_name, block_size, buffer_size):
+    def __init__(self, db_name, block_size, buffer_size): #As of right now buffer_size is not being used
         self.db_name = db_name,
         self.block_size = block_size
         self.buffer_size = buffer_size
@@ -89,28 +97,29 @@ class LogMgr:
         self.current_lsn = 0
         self.last_saved_lsn = 0
 
-        self.log_page = Page(fm.block_size)
-        log_block_count = fm.length(self.log_file)
+        self.log_page = Page(self.file_mgr.block_size)
+        log_block_count = self.file_mgr.length(self.log_file)
+
         if log_block_count:
             # read last block of log file
             self.log_block = Block(self.log_file, log_block_count-1)
-            fm.read(self.log_block, self.log_page)
+            self.file_mgr.read(self.log_block, self.log_page)
         else:
             # create new log, block and page 
-            self.log_block = fm.append(self.log_file)
-            self.log_page.setData(0, fm.block_size)
-            fm.write(self.log_block, self.log_page)
+            self.log_block = self.file_mgr.append(self.log_file)
+            self.log_page.setData(0, self.file_mgr.block_size)
+            self.file_mgr.write(self.log_block, self.log_page)
             
     def append(self, log_record):
         boundary = self.log_page.getInt(0)
         bytes_needed = len(log_record) + 4 # for writing lenght of binary blob
         if boundary - bytes_needed < 4: # first 4 bytes are reserved
             self.flush() 
-            self.log_block = fm.append(self.log_file) # appendNewBlock()
-            self.log_page = Page(fm.block_size) # not present in the book
-            self.log_page.setData(0, fm.block_size)
+            self.log_block = self.file_mgr.append(self.log_file) # appendNewBlock()
+            self.log_page = Page(self.file_mgr.block_size) # not present in the book
+            self.log_page.setData(0, self.file_mgr.block_size)
             boundary = self.log_page.getInt(0)
-            fm.write(self.log_block, self.log_page) # writing the newly created block/page immidiately emulates always having the latest block/page in log_block/log_page
+            self.file_mgr.write(self.log_block, self.log_page) # writing the newly created block/page immidiately emulates always having the latest block/page in log_block/log_page
 
         offset = boundary - bytes_needed 
         self.log_page.setData(offset, log_record) # ACTUAL WRITE
@@ -119,23 +128,101 @@ class LogMgr:
         return self.current_lsn
 
     def flush(self):
-        fm.write(self.log_block, self.log_page)
+        self.file_mgr.write(self.log_block, self.log_page)
         self.last_saved_lsn = self.current_lsn
 
+    # this is a stateful function; depends on what block log manager is currently working on
+    def iterator(self):
+        self.flush()
+        return LogIter(self.file_mgr, self.log_block) # Returning the current block
+
+
+class LogIter:
+    def __init__(self, fm, block):
+        self.fm = fm
+        self.block = block
+
+
+    def __iter__(self):
+        self.temp_page = Page(self.fm.block_size)
+        fm.read(self.block, self.temp_page)
+        self.current_offset = self.temp_page.getInt(0)
+
+        return self
+
+    def __next__(self):
+        if self.current_offset >= self.fm.block_size:
+            self.block = Block(self.block.file_name, self.block.block_number-1)
+            if self.block.block_number < 0:
+                raise StopIteration()
+            else:
+                fm.read(self.block, self.temp_page)
+                self.current_offset = self.temp_page.getInt(0)
+
+        log_record = self.temp_page.getByte(self.current_offset) 
+        self.current_offset = self.current_offset + len(log_record) + 4 # 4 bytes tho skip the length of the Byte blob
+        return log_record 
+
+
+class Buffer:
+    def __init__(self, fm, lm):
+        self.fm = fm
+        self.lm = lm
+
+    def contents(self):
+        pass
+
+class BufferMgr:
+    def __init__(self, fm, lm, num_buffers):
+        self.fm = fm
+        self.lm = lm
+        self.num_buffers = num_buffers
+
+        self.buffers = [Buffer(self.fm, self.lm) for _ in range(self.num_buffers)]
+
+    def pin(self):
+        pass
+
+    def unpin(self):
+        pass
+
+fm = FileMgr('simpledb', 400, 8)
+lm = LogMgr(fm, 'tst_log')
+bm = BufferMgr(fm, lm, 3) 
+buff1 = bm.pin() 
+exit()
 
 fm = FileMgr('simpledb', 400, 8) # Kernel page size; usually 4096 bytes
-lg = LogMgr(fm, 'tst_log')
+lm = LogMgr(fm, 'tst_log')
 
 def createLogRecord(s,i):
     temp_bytearray = bytearray(4 + len(s) + 4)
     temp_page = Page(temp_bytearray)
     pos = temp_page.setData(0, s)
     temp_page.setData(pos, i) 
-    lg.append(temp_page.bb)
+    lsn = lm.append(temp_page.bb)
+    return lsn
 
-for i in range(1, 71):
+for i in range(1, 36):
     lsn = createLogRecord('record' + str(i), i + 100)
-lg.flush()
+    print('lsn created' + str(lsn))
+
+for l in lm.iterator():
+    temp_page = Page(l) # We have keep it in memory to parse its content
+    record_str = temp_page.getStr(0)
+    record_int = temp_page.getInt(4 + len(record_str)) # also need to add 4 byte for the recoded length of the string
+    print('Reading record ' + record_str + str(record_int))
+
+for i in range(36, 71):
+    lsn = createLogRecord('record' + str(i), i + 100)
+    print('lsn created' + str(lsn))
+
+for l in lm.iterator():
+    temp_page = Page(l) # We have keep it in memory to parse its content
+    record_str = temp_page.getStr(0)
+    record_int = temp_page.getInt(4 + len(record_str)) # also need to add 4 byte for the recoded length of the string
+    print('Reading record ' + record_str + str(record_int))
+
 exit()
 
 # file for each table; many blocks(identified by id) for each file
