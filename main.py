@@ -2,6 +2,16 @@
 # concurrency manager interleaves the regulation of transactions from different clients
 # recovery manager write record of those transactions in a log so uncommited transactions can be recovered
 
+# file system allows accessing raw disk in blocks.
+# in db, each file is treated like a raw disk
+# db access each file by virtual blocks(OR translates these blocks into physical blocks using file system)
+# db reads block into pages
+# db maintain a pool of pages in memory
+# db read and write is done on those poled pages
+# By only operating in memory, db can control when writing to disk is happening
+# Each table, table index and db log are stored in a single file
+# Postgresql uses 8kB as block size
+
 import os
 
 class Block:
@@ -19,10 +29,14 @@ class Block:
 # f.write(page) # will trigger system write as there is no buffering
 class Page:
     def __init__(self, data):
+        # get either size to create an empty page, or data that needs to put in a page
+        # bytearray(data) allocates new one in memory - usage is heavily controlled by Buffer manager
+        # self.bb = data uses what is already in the memory
         # log manager(saves it log in memory, and dumps to this page) send bytearay; 
-        # buffer manager send length of bytearray 
+        # buffer manager send length of bytearray
         self.bb = data if isinstance(data, bytearray) else bytearray(data)
 
+    # callee is reponsible ensuring there are required space for the data 
     def setData(self, start, data):
         if isinstance(data, int):
             data_bin = data.to_bytes(4, 'big') # chosing to convert integer to 4 bytes in big endian, which is the same way we write and read numbers
@@ -35,6 +49,7 @@ class Page:
             data_bin = data_bin_len + data
 
         data_len = len(data_bin)
+        # Do I need to create + new block to the file for data that exceeds boundary
         self.bb[start:start + data_len] = data_bin
         return data_len 
   
@@ -50,8 +65,11 @@ class Page:
         byte_len = self.getInt(start)
         return self.bb[start+4 : start+4+byte_len]
 
-
+# Purpose of this class is to write a page to a block
+# Read and trigger immediate disk operation( because buffering it set to 0) to ensure data is saved to disk
+# TODO: read, write and append methods needs to be synchronized
 class FileMgr:
+    # https://stackoverflow.com/questions/1466000/difference-between-modes-a-a-w-w-and-r-in-built-in-open-function
     def __init__(self, db_name, block_size, buffer_size): #As of right now buffer_size is not being used
         self.db_name = db_name,
         self.block_size = block_size
@@ -67,16 +85,16 @@ class FileMgr:
         f.close()
     
     def write(self, block, page):
-        f = open(block.file_name, 'r+b', buffering=0)
+        f = open(block.file_name, 'r+b', buffering=0) # r is used because a prevents seek and w truncates the file
         f.seek(self.block_size * block.block_number)
         f.write(page.bb) 
         f.close()
 
     # Append a new block to the provided (log) file and return the block reference
     def append(self, fileName):
-        f = open(fileName, 'a+b', buffering=0) # How does append mode behave if file do not exists?
+        f = open(fileName, 'ab', buffering=0) # How does append mode behave if file do not exists?
         new_block_number = self.length(fileName)
-        f.seek(self.block_size * new_block_number)
+        f.seek(self.block_size * new_block_number) # seek doesn't with with append mode
         temp_page = Page(self.block_size)
         f.write(temp_page.bb)
         f.close()
@@ -86,7 +104,10 @@ class FileMgr:
         try :
             return os.path.getsize(file_name) // self.block_size 
         except:
-            open(file_name, 'w+b', buffering=0)
+            # trying to get number of block in a file that doesn't exist
+            # context manager cleanup resources
+            with open(file_name, 'wb', buffering=0):
+                pass
             return 0
 
         
@@ -101,7 +122,7 @@ class LogMgr:
         log_block_count = self.file_mgr.length(self.log_file)
 
         if log_block_count:
-            # read last block of log file
+            # read last block of log file and put it in a page
             self.log_block = Block(self.log_file, log_block_count-1)
             self.file_mgr.read(self.log_block, self.log_page)
         else:
@@ -110,14 +131,17 @@ class LogMgr:
             self.log_page.setData(0, self.file_mgr.block_size)
             self.file_mgr.write(self.log_block, self.log_page)
             
+    # add b'log_record' to current log_page and return current_lsn
     def append(self, log_record):
         boundary = self.log_page.getInt(0)
-        bytes_needed = len(log_record) + 4 # for writing lenght of binary blob
+        bytes_needed = len(log_record) + 4 # for writing lengh of binary blob
+
+        # check if there is room for the new log record on the current page
         if boundary - bytes_needed < 4: # first 4 bytes are reserved
-            self.flush() 
+            self.flush()
             self.log_block = self.file_mgr.append(self.log_file) # appendNewBlock()
             self.log_page = Page(self.file_mgr.block_size) # not present in the book
-            self.log_page.setData(0, self.file_mgr.block_size)
+            self.log_page.setData(0, self.file_mgr.block_size) # at the beginning the page is empty
             boundary = self.log_page.getInt(0)
             self.file_mgr.write(self.log_block, self.log_page) # writing the newly created block/page immidiately emulates always having the latest block/page in log_block/log_page
 
@@ -127,13 +151,19 @@ class LogMgr:
         self.current_lsn += 1
         return self.current_lsn
 
-    def flush(self):
-        self.file_mgr.write(self.log_block, self.log_page)
-        self.last_saved_lsn = self.current_lsn
+    # Log manager manually decides when to write the page to disk
+    def flush(self, lsn=None):
+        if not lsn:
+            self.file_mgr.write(self.log_block, self.log_page)
+            self.last_saved_lsn = self.current_lsn # because we will be flushing all logs from the single log page
+            return
+
+        if lsn > self.last_saved_lsn: # TODO: do we need >= instead?
+            self.flush()
 
     # this is a stateful function; depends on what block log manager is currently working on
     def iterator(self):
-        self.flush()
+        self.flush() # we flush one page, log manager is holding, to disk
         return LogIter(self.file_mgr, self.log_block) # Returning the current block
 
 
@@ -147,21 +177,20 @@ class LogIter:
         self.temp_page = Page(self.fm.block_size)
         fm.read(self.block, self.temp_page)
         self.current_offset = self.temp_page.getInt(0)
-
-        return self
+        return self # returning self because in each loop self.__next__ will be called
 
     def __next__(self):
-        if self.current_offset >= self.fm.block_size:
-            self.block = Block(self.block.file_name, self.block.block_number-1)
+        if self.current_offset >= self.fm.block_size: # reached at the end of the block
+            self.block = Block(self.block.file_name, self.block.block_number-1) # Why -1? Doesn't block number start
             if self.block.block_number < 0:
                 raise StopIteration()
             else:
-                fm.read(self.block, self.temp_page)
+                self.fm.read(self.block, self.temp_page)
                 self.current_offset = self.temp_page.getInt(0)
 
         log_record = self.temp_page.getByte(self.current_offset) 
         self.current_offset = self.current_offset + len(log_record) + 4 # 4 bytes tho skip the length of the Byte blob
-        return log_record 
+        return log_record
 
 
 class Buffer:
@@ -186,49 +215,58 @@ class BufferMgr:
     def unpin(self):
         pass
 
-fm = FileMgr('simpledb', 400, 8)
-lm = LogMgr(fm, 'tst_log')
-bm = BufferMgr(fm, lm, 3) 
-buff1 = bm.pin() 
-exit()
+# Each set of interaction with the database is a transactions
+# Transaction is completed when it has committed or rolledback and released all locks
+class Transaction:
+    pass
+
+# fm = FileMgr('simpledb', 400, 8)
+# lm = LogMgr(fm, 'tst_log')
+# bm = BufferMgr(fm, lm, 3)
+# buff1 = bm.pin()
+# buff1 = bm.pin()
+# exit()
 
 fm = FileMgr('simpledb', 400, 8) # Kernel page size; usually 4096 bytes
 lm = LogMgr(fm, 'tst_log')
 
+
 def createLogRecord(s,i):
-    temp_bytearray = bytearray(4 + len(s) + 4)
-    temp_page = Page(temp_bytearray)
+    temp_bytearray = bytearray(4 + len(s) + 4) # length of string + string + one number
+    temp_page = Page(temp_bytearray) # creating page with desired size because
     pos = temp_page.setData(0, s)
-    temp_page.setData(pos, i) 
+    temp_page.setData(pos, i)
     lsn = lm.append(temp_page.bb)
     return lsn
 
+
 for i in range(1, 36):
     lsn = createLogRecord('record' + str(i), i + 100)
-    print('lsn created' + str(lsn))
+    print('Adding ' + '(lsn: ' + str(lsn) + '): \t' + 'record' + str(i) + str(i + 100))
 
 for l in lm.iterator():
     temp_page = Page(l) # We have keep it in memory to parse its content
     record_str = temp_page.getStr(0)
     record_int = temp_page.getInt(4 + len(record_str)) # also need to add 4 byte for the recoded length of the string
-    print('Reading record ' + record_str + str(record_int))
+    print('Reading:  ' + record_str + str(record_int))
 
 for i in range(36, 71):
     lsn = createLogRecord('record' + str(i), i + 100)
-    print('lsn created' + str(lsn))
+    print('Adding ' + '(lsn: ' + str(lsn) + '): \t' + 'record' + str(i) + str(i + 100))
 
 for l in lm.iterator():
     temp_page = Page(l) # We have keep it in memory to parse its content
     record_str = temp_page.getStr(0)
     record_int = temp_page.getInt(4 + len(record_str)) # also need to add 4 byte for the recoded length of the string
-    print('Reading record ' + record_str + str(record_int))
+    print('Reading:  ' + record_str + str(record_int))
 
 exit()
 
-# file for each table; many blocks(identified by id) for each file
+# 3.12 Testing file manager
+# File for each table; many blocks(identified by id) for each file
 # these files needs to be created inside a folded named $db
 fm = FileMgr('simpledb', 400, 8) # Kernel page size; usually 4096 bytes
-b1 = Block('testfile', 2) 
+b1 = Block('testfile', 2)
 p1 = Page(fm.block_size)
 pos = 88 # position relative to the current block, so should always be between 0 <= block_size < 400
 new_pos = pos + p1.setData(pos, 'abcdefghijklm')
@@ -239,4 +277,3 @@ temp_page = Page(fm.block_size)
 fm.read(b1, temp_page)
 print(temp_page.getStr(pos))
 print(temp_page.getInt(new_pos))
-        
