@@ -67,7 +67,7 @@ class Page:
 
 # Purpose of this class is to write a page to a block
 # Read and trigger immediate disk operation( because buffering it set to 0) to ensure data is saved to disk
-# TODO: read, write and append methods needs to be synchronized
+# TODO: readBlockToPage, writePageToBlock and appendEmptyBlock methods needs to be synchronized
 class FileMgr:
     # https://stackoverflow.com/questions/1466000/difference-between-modes-a-a-w-w-and-r-in-built-in-open-function
     def __init__(self, db_name, block_size, buffer_size): #As of right now buffer_size is not being used
@@ -75,7 +75,7 @@ class FileMgr:
         self.block_size = block_size
         self.buffer_size = buffer_size
 
-    def read(self, block, page):
+    def readBlockToPage(self, block, page):
         f = open(block.file_name, 'rb', buffering=0) # Does buffering has any effect on reading?
         f.seek(self.block_size * block.block_number)
         # Making sure we are only reading the block size of the file
@@ -84,17 +84,17 @@ class FileMgr:
         page.bb = bytearray(f.read(self.block_size))
         f.close()
     
-    def write(self, block, page):
+    def writePageToBlock(self, block, page):
         f = open(block.file_name, 'r+b', buffering=0) # r is used because a prevents seek and w truncates the file
         f.seek(self.block_size * block.block_number)
         f.write(page.bb) 
         f.close()
 
     # Append a new block to the provided (log) file and return the block reference
-    def append(self, fileName):
+    def appendEmptyBlock(self, fileName):
         f = open(fileName, 'ab', buffering=0) # How does append mode behave if file do not exists?
         new_block_number = self.length(fileName)
-        f.seek(self.block_size * new_block_number) # seek doesn't with with append mode
+        f.seek(self.block_size * new_block_number) # seek doesn't with a mode
         temp_page = Page(self.block_size)
         f.write(temp_page.bb)
         f.close()
@@ -124,26 +124,26 @@ class LogMgr:
         if log_block_count:
             # read last block of log file and put it in a page
             self.log_block = Block(self.log_file, log_block_count-1)
-            self.file_mgr.read(self.log_block, self.log_page)
+            self.file_mgr.readBlockToPage(self.log_block, self.log_page)
         else:
             # create new log, block and page 
-            self.log_block = self.file_mgr.append(self.log_file)
+            self.log_block = self.file_mgr.appendEmptyBlock(self.log_file)
             self.log_page.setData(0, self.file_mgr.block_size)
-            self.file_mgr.write(self.log_block, self.log_page)
+            self.file_mgr.writePageToBlock(self.log_block, self.log_page)
             
     # add b'log_record' to current log_page and return current_lsn
-    def append(self, log_record):
+    def appendLog(self, log_record):
         boundary = self.log_page.getInt(0)
         bytes_needed = len(log_record) + 4 # for writing lengh of binary blob
 
         # check if there is room for the new log record on the current page
         if boundary - bytes_needed < 4: # first 4 bytes are reserved
-            self.flush()
-            self.log_block = self.file_mgr.append(self.log_file) # appendNewBlock()
+            self.flushPage()
+            self.log_block = self.file_mgr.appendEmptyBlock(self.log_file) # appendNewBlock()
             self.log_page = Page(self.file_mgr.block_size) # not present in the book
             self.log_page.setData(0, self.file_mgr.block_size) # at the beginning the page is empty
             boundary = self.log_page.getInt(0)
-            self.file_mgr.write(self.log_block, self.log_page) # writing the newly created block/page immidiately emulates always having the latest block/page in log_block/log_page
+            self.file_mgr.writePageToBlock(self.log_block, self.log_page) # writing the newly created block/page immidiately emulates always having the latest block/page in log_block/log_page
 
         offset = boundary - bytes_needed 
         self.log_page.setData(offset, log_record) # ACTUAL WRITE
@@ -152,18 +152,18 @@ class LogMgr:
         return self.current_lsn
 
     # Log manager manually decides when to write the page to disk
-    def flush(self, lsn=None):
+    def flushPage(self, lsn=None):
         if not lsn:
-            self.file_mgr.write(self.log_block, self.log_page)
+            self.file_mgr.writePageToBlock(self.log_block, self.log_page)
             self.last_saved_lsn = self.current_lsn # because we will be flushing all logs from the single log page
             return
 
         if lsn > self.last_saved_lsn: # TODO: do we need >= instead?
-            self.flush()
+            self.flushPage()
 
     # this is a stateful function; depends on what block log manager is currently working on
     def iterator(self):
-        self.flush() # we flush one page, log manager is holding, to disk
+        self.flushPage() # we flush one page, log manager is holding, to disk
         return LogIter(self.file_mgr, self.log_block) # Returning the current block
 
 
@@ -172,10 +172,9 @@ class LogIter:
         self.fm = fm
         self.block = block
 
-
     def __iter__(self):
         self.temp_page = Page(self.fm.block_size)
-        fm.read(self.block, self.temp_page)
+        fm.readBlockToPage(self.block, self.temp_page)
         self.current_offset = self.temp_page.getInt(0)
         return self # returning self because in each loop self.__next__ will be called
 
@@ -185,14 +184,14 @@ class LogIter:
             if self.block.block_number < 0:
                 raise StopIteration()
             else:
-                self.fm.read(self.block, self.temp_page)
+                self.fm.readBlockToPage(self.block, self.temp_page)
                 self.current_offset = self.temp_page.getInt(0)
 
         log_record = self.temp_page.getByte(self.current_offset) 
         self.current_offset = self.current_offset + len(log_record) + 4 # 4 bytes tho skip the length of the Byte blob
         return log_record
 
-
+# pins page to block and tracks pin count
 class Buffer:
     def __init__(self, fm, lm):
         self.fm = fm
@@ -201,6 +200,11 @@ class Buffer:
     def contents(self):
         pass
 
+# BufferMgr does two things.
+#   track changes to page(new data) and
+#   (delay) write the modified page back to disk. Write happens when
+#       1. page is getting pined to a diff block,
+#       2. Recovery manager needs to write pages to prevent data loss
 class BufferMgr:
     def __init__(self, fm, lm, num_buffers):
         self.fm = fm
@@ -220,6 +224,7 @@ class BufferMgr:
 class Transaction:
     pass
 
+# Fig 4.11 Testing Buffer
 # fm = FileMgr('simpledb', 400, 8)
 # lm = LogMgr(fm, 'tst_log')
 # bm = BufferMgr(fm, lm, 3)
@@ -227,16 +232,18 @@ class Transaction:
 # buff1 = bm.pin()
 # exit()
 
+# Fig 4.12 Testing Buffer Manager
+
+# Fig 4.5 Testing Log Manager
 fm = FileMgr('simpledb', 400, 8) # Kernel page size; usually 4096 bytes
 lm = LogMgr(fm, 'tst_log')
-
 
 def createLogRecord(s,i):
     temp_bytearray = bytearray(4 + len(s) + 4) # length of string + string + one number
     temp_page = Page(temp_bytearray) # creating page with desired size because
     pos = temp_page.setData(0, s)
     temp_page.setData(pos, i)
-    lsn = lm.append(temp_page.bb)
+    lsn = lm.appendLog(temp_page.bb)
     return lsn
 
 
@@ -271,9 +278,9 @@ p1 = Page(fm.block_size)
 pos = 88 # position relative to the current block, so should always be between 0 <= block_size < 400
 new_pos = pos + p1.setData(pos, 'abcdefghijklm')
 p1.setData(new_pos, 345)
-fm.write(b1, p1)
+fm.writePageToBlock(b1, p1) # won't work because r+b is expecting the file to exists; in LogTest we are creating the empty file in appendEmptyBlock
 
 temp_page = Page(fm.block_size)
-fm.read(b1, temp_page)
+fm.readBlockToPage(b1, temp_page)
 print(temp_page.getStr(pos))
 print(temp_page.getInt(new_pos))
