@@ -16,6 +16,7 @@ import os
 
 import logging
 import threading
+import time
 
 # debug,info,waring,error,critical
 logging.basicConfig(format='{filename}, at line {lineno}, on {threadName} {asctime}: {message}', style='{', level=logging.INFO, datefmt="%H:%M:%S")
@@ -28,6 +29,12 @@ class Block:
 
     def __eq__(self, other):
         return self.file_name == other.file_name and self.block_number == other.block_number
+
+    def __repr__(self):
+        return "[file name: " + self.file_name + ", block num: " + str(self.block_number) + "]"
+
+    # def __str__(self):
+    #     return "[file name: " + self.file_name + ", block num: " + str(self.block_number) + "]"
 
     # implement __eq__, __hash__, __str__
 
@@ -234,7 +241,7 @@ class Buffer:
         self.flush()
         self.block = block
         self.fm.readBlockToPage(block, self.page) # save the requested block to the Buffer's page
-        self.pin_count = 0 # TODO: why we are not incrementing pin count anytime we are reading a block
+        self.pin_count = 0 # why we are not incrementing pin count anytime we are reading a block; pin count zero could also mean no client actively using it anymore
 
     def flush(self):
         if self.txnum >= 0:
@@ -270,17 +277,32 @@ class BufferMgr:
 
         self.buffer_pool = [Buffer(self.fm, self.lm) for _ in range(self.num_buffers)]
         self.pool_availability = self.num_buffers
+        self._condition = threading.Condition()
+
+    def flushAll(self, at_txnum):
+        with self._condition:
+            for b in bm.buffer_pool:
+                if b.txnum > at_txnum: # TODO: find what is happening here
+                    b.flush()
 
     def pin(self, target_block):
-        # Condition variable will allow u
-        # this needs to be in a thread waited loop
-        return self.tryToPin(target_block)
+        b = self.tryToPin(target_block)
+        start = time.time()
+        while not b:
+            if time.time() - start < 10:
+                b = self.tryToPin(target_block)
+            else:
+                raise Exception("Buffer Pool is full.")
+
+        return b
+
 
     def unpin(self, target_buffer):
-        target_buffer.unpin()
-        if not target_buffer.pin_count > 0:
-            self.pool_availability += 1 # No client is using it. New request to pin is now eligible to replace this buffer
-            # notifyAll() # this java method notify any thread waiting for availability in the buffer pool
+        with self._condition:
+            target_buffer.unpin()
+            if not target_buffer.pin_count > 0:
+                self.pool_availability += 1 # No client is using it. New request to pin is now eligible to replace this buffer
+                self._condition.notify_all() # TODO: Check if this works. (notify all thread that is waiting for buffer pool to be available)
 
     def tryToPin(self, target_block):
         b = self.findExistingBuffer(target_block) # check if the requested block is already present in the buffer pool
@@ -318,6 +340,36 @@ class BufferMgr:
 class Transaction:
     pass
 
+# Fig 4.12 Testing Buffer Manager
+fm = FileMgr('simpledb', 400, 8)
+lm = LogMgr(fm, 'tst_log')
+bm = BufferMgr(fm, lm, 3)
+buff = [] # we will append six BLock references in this list
+buff.append(bm.pin(Block('testfile', 0)))
+buff.append(bm.pin(Block('testfile', 1)))
+buff.append(bm.pin(Block('testfile', 2)))
+bm.unpin(buff[1]) # unpin testfile, 1
+buff[1] = None
+buff.append(bm.pin(Block('testfile', 0))) # no effect
+buff.append(bm.pin(Block('testfile', 1))) # pin testfile, 1 again
+print('Available buffer count: ' + str(bm.pool_availability))
+try:
+    print("Attempting to pin block 3...")
+    buff.append(bm.pin(Block('testfile', 3)))
+except Exception as e:
+    print("Exception: " + str(e))
+bm.unpin(buff[2]) # unpin testfile, 2
+buff[2] = None
+buff.append(bm.pin(Block('testfile', 3))) # pin testfile, 3
+
+print("Final buffer allocation.")
+for i in range(len(buff)):
+    if buff[i]:
+        print('buff[' + str(i) + '] pinned to block ' + str(buff[i].block))
+
+exit()
+
+
 # Fig 4.11 Testing Buffer
 fm = FileMgr('simpledb', 400, 8)
 lm = LogMgr(fm, 'tst_log')
@@ -338,10 +390,9 @@ buff11 = bm.pin(Block('testfile', 1))
 buff11.page.setData(80, 9999)
 buff11.setModified(1, 0)
 buff11.unpin() # This modification won't get written to disk because there is noting forcing it
+bm.flushAll(2)
 
 exit()
-
-# Fig 4.12 Testing Buffer Manager
 
 # Fig 4.5 Testing Log Manager
 fm = FileMgr('simpledb', 400, 8) # Kernel page size; usually 4096 bytes
