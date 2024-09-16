@@ -1,5 +1,7 @@
 # Explain:
 #   Final paragraph of 5.3.9.2
+# Goals
+#   Have query engine support reading other table format such as hive
 
 # each interactino with db is a transaction
 # concurrency manager interleaves the regulation of transactions from different clients
@@ -18,7 +20,7 @@
 # ch2 simpledb.file     (done)
 # ch3 simpledb.log      (done)
 # ch4 simpledb.buffer   (done)
-# ch5 simpledb.tx
+# ch5 simpledb.tx       (done)
 # ch6 simpledb.record
 # ch7 simpledb.metadata
 # ch8 simpledb.query
@@ -676,19 +678,25 @@ class LockTable:
             # Since multiple threads are woken up; another thread might race first to xlock before current thread
             # That's is when this check will fail; and prompt the client to try again
             if LockTable._all_locks[target_block] < 0:
-                raise Exception('Another thread acquired the xLock or current thread has waited too long. Try again.')
+                raise Exception('Tx aborted because it waited to long to acquire slock or another Tx raced first to acquire the slock. Try again.')
             LockTable._all_locks[target_block] += 1
 
+    # We use Approximate Deadlock Detection to prevent Tx from waiting to obtain for a lock for too long
+    # Here, we prevent deadlock by aborting Tx that is waiting too long(10 sec) for a lock.
+    # Long wait time doesn't mean deadlock, it could also mean a lot of data is being written
+    # Meaning, our approach react to situation that could potentially lead to deadlock, which may or may not be an actual deadlock
     # similar to BufferMgr.pin
     def xLock(self, target_block):
         with self._condition:
             start = time.time()
+            # > 1 is because slock is obtained before attempting to xlock
+            # meaning, if a transaction has xlock on a block, it is implies that it also have slock on it
             while LockTable._all_locks[target_block] > 1 and (time.time() - start) < 10:
                 self._condition.wait(2.0)
 
             # see sLock function doc
             if LockTable._all_locks[target_block] > 1:
-                raise Exception('Another thread acquired the sLock or current thread has waited too long. Try again.')
+                raise Exception('Tx aborted because it waited to long to acquire xlock or another Tx raced first to acquire the xlock. Try again.')
             LockTable._all_locks[target_block] = -1
 
     # release lock on a block
@@ -736,14 +744,14 @@ class LockTable:
 # But all CM refer to a static instance of lock table
 # This static instance of lock table keeps all locks obtained by all transactions
 class ConcurrencyMgr:
-    db_locktable = LockTable() # ConcurrencyMgr.db_locktable
+    _global_locktable = LockTable() # ConcurrencyMgr.db_locktable
 
     def __init__(self):
         self.tx_locks = {}
 
     def sLock(self, target_block):
         if target_block not in self.tx_locks:
-            ConcurrencyMgr.db_locktable.sLock(target_block)
+            ConcurrencyMgr._global_locktable.sLock(target_block)
             self.tx_locks[target_block] = 'S'
         # else CM always has a sLock no the block
 
@@ -751,12 +759,12 @@ class ConcurrencyMgr:
         if not (target_block in self.tx_locks and self.tx_locks[target_block] == 'X'):
             # this block is already in the tx_locks list and we have xLock on it
             self.sLock(target_block)
-            ConcurrencyMgr.db_locktable.xLock(target_block)
+            ConcurrencyMgr._global_locktable.xLock(target_block)
             self.tx_locks[target_block] = 'X'
 
     def release(self):
         for block in self.tx_locks.keys():
-            ConcurrencyMgr.db_locktable.unlock(block)
+            ConcurrencyMgr._global_locktable.unlock(block)
         self.tx_locks.clear()
 
 
@@ -774,7 +782,7 @@ class BufferList:
 
     def unpin(self, target_block):
         bm.unpin(self.block_buffer_map[target_block])
-        self.block_pin_history.remove(target_block)
+        self.block_pin_history.remove(target_block) # remove the first entry, one instance, of matching block
         if target_block not in self.block_pin_history:
             del self.block_buffer_map[target_block]
 
@@ -939,9 +947,101 @@ class Transaction:
             Transaction._next_txnum += 1
         return Transaction._next_txnum
 
+# Tables are a collection of field(columns) and records(row)
+# Record manager determines the structure of the record(spanned/unspanned; homogeneous/nonhomogeneous) in the block
+# block/page contains records, we call it record page
+# RM uses  Schema and Layout class to manage record's information
+class RecordMgr:
+    pass
+
+# Metadata is data that describes the database
+# Record manager needs record layout to decode the content of each block
+# record layout is an example of metadata stored by the database
+# database metadata is stored by metadata manager
+class MetadataMgr:
+    pass
+
+
+
+# Fig 5.19 ConcurrencyTest; Testing Concurrency class
+fm = FileMgr('SimpleDB', 400, 8)
+lm = LogMgr(fm, 'tst_log')
+bm = BufferMgr(fm, lm, 8)
+
+def A():
+    try:
+        txA = Transaction(fm, lm, bm)
+        blk1 = Block('testfile', 1)
+        blk2 = Block('testfile', 2)
+        txA.pin(blk1)
+        txA.pin(blk2)
+        print('txA requesting slock1')
+        txA.getInt(blk1, 0)
+        print('txA received slock1')
+        time.sleep(1)
+        print('txA requesting slock2')
+        txA.getInt(blk2, 0)
+        print('txA received slock2')
+        txA.commit()
+    except Exception as e:
+        txA.rollback()
+        print("Exception: " + str(e))
+
+def B():
+    try:
+        txB = Transaction(fm, lm, bm)
+        blk1 = Block('testfile', 1)
+        blk2 = Block('testfile', 2)
+        txB.pin(blk1)
+        txB.pin(blk2)
+        print('txB requesting xlock2')
+        txB.setInt(blk2, 0, 0, False)
+        print('txB received xlock2')
+        time.sleep(1)
+        print('txB requesting slock1')
+        txB.getInt(blk1, 0)
+        print('txB received slock1')
+        txB.commit()
+    except Exception as e:
+        txB.rollback()
+        print("Exception: " + str(e))
+
+def C():
+    try:
+        txC = Transaction(fm, lm, bm)
+        blk1 = Block('testfile', 1)
+        blk2 = Block('testfile', 2)
+        txC.pin(blk1)
+        txC.pin(blk2)
+        print('txC requesting xlock1')
+        txC.setInt(blk1, 0, 0, False)
+        print('txC received xlock1')
+        time.sleep(1)
+        print('txC requesting slock2')
+        txC.getInt(blk2, 0)
+        print('txC received slock2')
+        txC.commit()
+    except Exception as e:
+        txC.rollback()
+        print("Exception: " + str(e))
+
+t1 = threading.Thread(target=A)
+t1.start()
+t2 = threading.Thread(target=B)
+t2.start()
+t3 = threading.Thread(target=C)
+t3.start()
+
+t1.join()
+t2.join()
+t3.join()
+
+for l in lm.iterator():
+    print(LogRecord.toString(l))
+
+exit()
 
 # Fig 5.3 TxTest; Testing Transactions
-
 fm = FileMgr('SimpleDB', 400, 8)
 lm = LogMgr(fm, 'tst_log')
 bm = BufferMgr(fm, lm, 8)
@@ -979,23 +1079,6 @@ print('post-rollback value at loc 80 = ', str(tx4.getInt(blk, 80)))
 tx4.commit()
 
 exit()
-
-
-
-# Tables are a collection of field(columns) and records(row)
-# Record manager determines the structure of the record(spanned/unspanned; homogeneous/nonhomogeneous) in the block
-# block/page contains records, we call it record page
-# RM uses  Schema and Layout class to manage record's information
-class RecordMgr:
-    pass
-
-# Metadata is data that describes the database
-# Record manager needs record layout to decode the content of each block
-# record layout is an example of metadata stored by the database
-# database metadata is stored by metadata manager
-class MetadataMgr:
-    pass
-
 
 # Fig 4.12 Testing Buffer Manager
 fm : FileMgr = FileMgr('simpledb', 400, 8)
