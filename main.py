@@ -17,13 +17,12 @@
 # Each table, table index and db log are stored in a single file
 # Postgresql uses 8kB as block size
 
-# ch2 simpledb.file     (done)
-# ch3 simpledb.log      (done)
-# ch4 simpledb.buffer   (done)
-# ch5 simpledb.tx       (done)
-# ch6 simpledb.record
+# ch3 simpledb.log          Page, Block, FileMgr
+# ch4 simpledb.buffer       LogMgr, LogIter, Buffer, BufferMgr
+# ch5 simpledb.tx           LogRecord, RecoveryMgr, LockTable, ConcurrencyMgr, BufferList, Transaction
+# ch6 simpledb.record       Scheme, Layout, RecordPage, RecordID, TableScan
 # ch7 simpledb.metadata
-# ch8 simpledb.query
+# ch8 simpledb.query        Scan, Predicate
 # ch9 simpledb.parse
 # ch10 simpledb.plan
 
@@ -140,6 +139,7 @@ class FileMgr:
     # if file does not exist we create a new one
     def writePageToBlock(self, block, page):
         with self._lock:
+            logging.info('Disk write of ' + str(block))
             f = open(block.file_name, 'r+b', buffering=0) # r is used because a prevents seek and w truncates the file
             f.seek(self.block_size * block.block_number)
             f.write(page.bb)
@@ -157,6 +157,7 @@ class FileMgr:
         return Block(fileName, new_block_number)
 
     def length(self, file_name):
+        """return the length of file in terms of block. Access through transaction to ensure thread safety."""
         try :
             return os.path.getsize(file_name) // self.block_size 
         except:
@@ -164,7 +165,7 @@ class FileMgr:
             # context manager cleanup resources
             with open(file_name, 'wb', buffering=0):
                 pass
-            return 0
+            return 0 # New file don't have any block in it
 
         
 class LogMgr:
@@ -283,7 +284,7 @@ class Buffer:
             # write ahead log; anytime we are about to flush a buffer; FLUSH THE LOG FIRST
             # This ensures Page 116, (b) doesn't happen when buffer on disk has the data but log do not
             # this line flush (write-ahead) log upto the lsn that modified this buffer
-            self.lm.flushPage(self.lsn)
+            self.lm.flushPage(self.lsn) # WRITE AHEAD LOG
 
             self.fm.writePageToBlock(self.block, self.page)
             self.txnum = -1
@@ -358,6 +359,7 @@ class BufferMgr:
     def tryToPin(self, target_block):
         b = self.findExistingBuffer(target_block) # check if the requested block is already present in the buffer pool
         if not b:
+            logging.info('Not in buffer pool ' + str(target_block))
             b = self.chooseUnpinnedBuffer() # requested block is not already in the buffer pool; so find an unpinned buffer
             if not b:
                 return None # requested block is neither in buffer pool nor we have any unpinned buffer
@@ -382,7 +384,7 @@ class BufferMgr:
     # requested block is not already in the buffer pool; so find an unpinned buffer
     def chooseUnpinnedBuffer(self):
         for b in self.buffer_pool:
-            if not b.pin_count > 0:
+            if not b.pin_count > 0: # TODO: pin_count = 0 implies no tx pinned any block to this buffer yet
                 return b
         return None
 
@@ -413,6 +415,7 @@ class LogRecord:
 
             temp_page = Page(op_offset + 4)
             temp_page.setData(op_offset, log_param['op'])
+            logging.info('Logging ' + LogRecord.toString(temp_page.bb))
             return log_param['lm'].appendLog(temp_page.bb)
         elif log_param['op'] == LogRecord.START or log_param['op'] == LogRecord.COMMIT or log_param['op'] == LogRecord.ROLLBACK:
             op_offset = 0
@@ -421,6 +424,7 @@ class LogRecord:
             temp_page = Page(txnum_offset + 4)
             temp_page.setData(op_offset, log_param['op'])
             temp_page.setData(txnum_offset, log_param['txnum'])
+            logging.info('Logging ' + LogRecord.toString(temp_page.bb))
             return log_param['lm'].appendLog(temp_page.bb)
         elif log_param['op'] == LogRecord.SETSTRING:
             op_offset = 0
@@ -437,6 +441,7 @@ class LogRecord:
             temp_page.setData(blk_num_offset, log_param['blk_num'])
             temp_page.setData(blk_offset_offset, log_param['blk_offset'])
             temp_page.setData(old_value_offset, log_param['old_val'])
+            logging.info('Logging ' + LogRecord.toString(temp_page.bb))
             return log_param['lm'].appendLog(temp_page.bb)
         elif log_param['op'] == LogRecord.SETINT:
             op_offset = 0
@@ -453,6 +458,7 @@ class LogRecord:
             temp_page.setData(blk_num_offset, log_param['blk_num'])
             temp_page.setData(blk_offset_offset, log_param['blk_offset'])
             temp_page.setData(old_value_offset, log_param['old_val'])
+            logging.info('Logging ' + LogRecord.toString(temp_page.bb))
             return log_param['lm'].appendLog(temp_page.bb)
 
     # extract log parameters from log byte array
@@ -526,7 +532,7 @@ class LogRecord:
             blk_num = temp_page.getInt(4 + 4 + (4 + len(blk_file)))
             blk_offset = temp_page.getInt(4 + 4 + (4 + len(blk_file)) + 4)
             old_val = temp_page.getStr(4 + 4 + (4 + len(blk_file)) + 4 + 4)
-            return '<SETSTRING, ' + str(txnum) + ', ' + blk_file + ', ' + str(blk_num) + ', ' + str(blk_offset) + ', ' + (str(old_val) if old_val else "''") + '>'
+            return '<SETSTRING, ' + str(txnum) + ', ' + blk_file + ', ' + str(blk_num) + ', ' + str(blk_offset) + ', ' + str(old_val) + '>'
 
 
 # RM treats db log as the source of truth; Therefore to maintain durability RM must flush logs to disk before completing a transaction
@@ -605,6 +611,8 @@ class RecoveryMgr:
     # Performs a single backward pass.
     # Recovery manger is oblivious current state of the database;
     # it writes old values without looking the current value
+    # Recovery requirs a dummy tx, meaning a redundent <start x> will be created before <checkpoint>
+    #   but it is not a problem since we never look at logs before <Checkpoint> anyway
     def recover(self):
         # go backward and only undo changes if the transaction was not complete(commit/rollback)
         # transaction without commit/rollback are treated as incomplete and their changes should be reversed
@@ -614,6 +622,7 @@ class RecoveryMgr:
             op, txnum = log_data[0], log_data[1]
             if op == LogRecord.CHECKPOINT:
                 return
+
             if op == LogRecord.COMMIT or op == LogRecord.ROLLBACK:
                 completed_tx.add(txnum)
                 continue
@@ -624,7 +633,7 @@ class RecoveryMgr:
 
         # Upon recovery completion; add checkpoint log
         self.bm.flushAll(self.txnum) # TODO: Flushing buffers should not be mandatory here.
-        lsn = LogRecord.createLogRecord(lm = lm, op = LogRecord.CHECKPOINT)
+        lsn = LogRecord.writeToLog(lm = lm, op = LogRecord.CHECKPOINT)
         self.lm.flushPage(lsn)
 
     # Transaction calls these set methods to write to log
@@ -881,7 +890,7 @@ class Transaction:
     def recover(self):
         # Unlike commit/rollback, there is no locking during recovery because the db server is running the recovery in a single transaction
         # Since multiple clients are not running, there is no need for locking - maintaining isolation property
-        self.bm.flushAll(self.txnum) # This line is not necessary if recovery is done during startup. Because buffer manager is empty at this point.
+        self.bm.flushAll(self.txnum) # This line is not necessary if recovery is done during startup. Buffer manager is empty at this point.
         self.rm.recover()
 
     # Transaction buffer access
@@ -907,19 +916,21 @@ class Transaction:
     # Write value (Uses CM for locking and RM for logging)
     def setInt(self, target_block, block_offset, new_val, okToLog):
         self.cm.xLock(target_block)
-        buf_ref : Buffer = self.bufferList.getBuffer(target_block)
+        buf_ref: Buffer = self.bufferList.getBuffer(target_block)
         lsn = -1
         if okToLog:
             lsn = self.rm.setInt(buf_ref, block_offset)
+        logging.info('Writing int ' + str(new_val) + ' to ' + str(buf_ref.block) + ' at ' + str(block_offset))
         buf_ref.page.setData(block_offset, new_val)
         buf_ref.setModified(self.txnum, lsn)
 
     def setString(self, target_block, block_offset, new_val, okToLog):
         self.cm.xLock(target_block)
-        buf_ref : Buffer = self.bufferList.getBuffer(target_block)
+        buf_ref: Buffer = self.bufferList.getBuffer(target_block)
         lsn = -1
         if okToLog:
             lsn = self.rm.setString(buf_ref, block_offset)
+        logging.info('Writing str ' + str(new_val) + ' to ' + str(buf_ref.block) + ' at ' + str(block_offset))
         buf_ref.page.setData(block_offset, new_val)
         buf_ref.setModified(self.txnum, lsn)
 
@@ -931,6 +942,7 @@ class Transaction:
     # size and append read and modifies the end of file marker
     # TODO: Size/append obtains a lock on Block(-1); but when it is being added to the list of buffers associated with a transactions?
     def size(self, filename):
+        """call fm.length() that returns block count of a file. Acquires lock on dummy block"""
         self.cm.sLock(Block(filename, -1))
         return fm.length(filename)
 
@@ -993,7 +1005,7 @@ class RecordPage:
         self.tx: Transaction = tx
         self.blk: Block = blk
         self.layout: Layout = layout
-        # self.tx.pin(blk) # defensive programming? RecordMgr is supposed to parse record page
+        self.tx.pin(blk) # TODO: Are we pinning here to ensure tx.get/set does not fail?
 
     def setInt(self, slot_index, field_name, field_value):
         blk_offset = (self.layout.slot_size * slot_index) + self.layout.offset[field_name]
@@ -1021,10 +1033,10 @@ class RecordPage:
         while ((slot_index * self.layout.slot_size) + self.layout.slot_size) < self.tx.fm.block_size:
             self.tx.setInt(self.blk, slot_index * self.layout.slot_size, 0, False)
             for field_name in self.layout.schema.getFields():
-                if self.layout.schema.field_info[field_name] == 'int':
+                if self.layout.schema.field_info[field_name]['field_type'] == 'int':
                     self.tx.setInt(self.blk, slot_index * self.layout.slot_size + self.layout.offset[field_name], 0, False)
                 else:
-                    self.tx.setString(self.blk, slot_index * self.layout.slot_size + self.layout.offset[field_name], '', False)
+                    self.tx.setString(self.blk, slot_index * self.layout.slot_size + self.layout.offset[field_name], '', False) # TODO: If we are not putting anything then recovery doesn't know what to do
             slot_index += 1
 
     def nextEmpty(self, current_slot_index):
@@ -1059,14 +1071,172 @@ class RecordID:
         self.blk_num = blk_num
         self.slot_num = slot_num
 
+    def __eq__(self, other):
+        return self.blk_num == other.blk_num and self.slot_num == other.slot_num
+
+    def __str__(self):
+        return "[block numer: " + str(self.blk_num) + ", slot number: " + str(self.slot_num) + "]"
+
+
+# The whole table lives on a single table
 # TableScan manages all records on a file
-# It maintains a cursor that moves from one record to another
-# Each record is identified by RecordID, which is block number and slot number within the block
-# once the cursor is pointing to a record we can get it's content using get/set method
-# next() moves the cursor from one record to another; does move from block to block
+# During constructor it is using tx, layout and table_name to automatically pointing to the first record
+
+# TableScan uses RecordPage to maintain reference to a single Block
+# TableScan opens the first block 0 from a file
+#   TableScan also need a transaction and layout information
+#   The layout is passed to the RecordPage, TableScan use RecordPage object to move from one record to another
+#   TableScan maintains a current_slot_index to know which slot it is reading/writing in that block
+# Each record in a file can be identified by block number and slot number, these two combined is called RecordID
+# next() moves the cursor forward; it also moves to the next block if there is no more record in the current block
 class TableScan:
+    def __init__(self, tx, tbl_name, layout):
+        self.tx = tx
+        self.table_name = tbl_name
+        self.file_name = self.table_name + '.tbl'
+        self.layout = layout
+
+        self.current_slot_index = -1 # TODO: Book is initializing this value to zero.
+        self.rp: RecordPage = None
+        if self.tx.size(self.file_name):
+            self.moveToBlock(0)
+        else:
+            self.moveToNewBlock()
+
+    def moveToNewBlock(self):
+        if self.rp:
+            self.tx.unpin(self.rp.blk)
+        new_blk = tx.append(self.file_name)
+        self.rp = RecordPage(self.tx, new_blk, self.layout) # tx.pin(rp.blk) happening in RecordPage constructor
+        self.rp.format()
+        self.current_slot_index = -1
+
+    def moveToBlock(self, block_num):
+        if self.rp:
+            self.tx.unpin(self.rp.blk)
+        new_blk = Block(self.file_name, block_num)
+        self.rp = RecordPage(self.tx, new_blk, self.layout)
+        self.current_slot_index = -1
+
+    # current_slot movement
+    def nextRecord(self):
+        self.current_slot_index = self.rp.nextAfter(self.current_slot_index)
+        while self.current_slot_index < 0:
+            if self.rp.blk.block_number == tx.size(self.file_name) - 1:
+                return False
+            self.moveToBlock(self.rp.blk.block_number + 1) # Moving to new block may not get us a filled out record...
+            self.current_slot_index = self.rp.nextAfter(self.current_slot_index) # ...so we continue
+        return True
+
+    def nextEmptyRecord(self):
+        self.insert()
+
+    # have current_slot_index point to an empty slot
+    def insert(self):
+        self.current_slot_index = self.rp.insertAfter(self.current_slot_index)
+        while self.current_slot_index < 0:
+            # we reached at the end of current block
+            if self.rp.blk.block_number == tx.size(self.file_name) - 1:
+                # this was the final block in the file, therefore append a new block to our table file
+                self.moveToNewBlock()
+            else:
+                # there are more blocks to this file, therefore move to the next block
+                self.moveToBlock(self.rp.blk.block_number + 1)
+            self.current_slot_index = self.rp.insertAfter(self.current_slot_index)
+
+    def deleteRecord(self):
+        self.rp.delete(self.current_slot_index)
+
+    def firstRecord(self):
+        self.beforeFirst()
+
+    def beforeFirst(self):
+        self.moveToBlock(0)
+
+    # RecordID
+    def moveToRecordID(self, rid : RecordID):
+        self.moveToBlock(rid.blk_num)
+        self.current_slot_index = rid.slot_num
+
+    # operate on the current_slot_index
+    def getInt(self, field_name):
+        return self.rp.getInt(self.current_slot_index, field_name)
+
+    def getString(self, field_name):
+        return self.rp.getString(self.current_slot_index, field_name)
+
+    def setInt(self, field_name, field_value):
+        self.rp.setInt(self.current_slot_index, field_name, field_value)
+
+    def setString(self, field_name, field_value):
+        self.rp.setString(self.current_slot_index, field_name, field_value)
+
+    def getRecordID(self):
+        return RecordID(self.rp.blk.block_number, self.current_slot_index)
+
+    def closeRecordPage(self):
+        if self.rp:
+            self.tx.unpin(self.rp.blk)
+
+
+# Catalog pages are in catalog files
+# Metadata is data that describes the database
+# Record manager needs record layout to decode the content of each block
+# record layout is an example of metadata stored by the database
+# database metadata is stored by metadata manager
+class MetadataMgr:
     pass
 
+
+# Fig 6.18 TableScanTest
+fm: FileMgr = FileMgr('SimpleDB', 400, 8)
+lm: LogMgr = LogMgr(fm, 'tst_log')
+bm: BufferMgr = BufferMgr(fm, lm, 2)
+tx: Transaction = Transaction(fm, lm, bm)
+sch: Schema = Schema()
+sch.addField('A', 'int', 4)
+sch.addField('B', 'str', 9)
+layout: Layout = Layout(sch)
+
+ts: TableScan = TableScan(tx, "T", layout)
+print('Insertion')
+rand_val = [49, 34, 40, 30, 1, 17, 18, 45, 27, 5, 7, 27, 43, 9, 31, 21, 2, 2, 28, 16, 44, 3, 14, 44, 47, 41, 22, 0, 23, 42, 3, 25, 3, 50, 29, 35, 28, 45, 50, 6, 49, 30, 18, 16, 42, 6, 8, 45, 11, 31]
+rand_count = 0
+ts.firstRecord()
+for i in range(50):
+    ts.nextEmptyRecord()
+    # temp_val = random.randint(0, 50)
+    temp_val = rand_val[rand_count]
+    rand_count += 1
+    ts.setInt('A', temp_val)
+    ts.setString('B', 'rec' + str(temp_val))
+    print('inserting ' + str(ts.getRecordID()) + '; ' + str(temp_val) + ' rec' + str(temp_val))
+
+print('Deletion')
+count = 0
+ts.firstRecord()
+while ts.nextRecord():
+    a = ts.getInt('A')
+    b = ts.getString('B')
+    if a < 25:
+        count += 1
+        print('Deleting ' + str(ts.getRecordID()) + ' ; value ' + str(a) + ' ' + b)
+        ts.deleteRecord()
+
+print('Retained')
+ts.firstRecord()
+while ts.nextRecord():
+    a = ts.getInt('A')
+    b = ts.getString('B')
+    print('Retained ' + str(ts.getRecordID()) + ' ; value ' + str(a) + ' ' + b)
+
+ts.closeRecordPage()
+tx.commit()
+
+for l in lm.iterator():
+    print(LogRecord.toString(l))
+
+exit()
 
 # Fig 6.15 RecordTest; Testing RecordPage, Schema, Layout
 fm: FileMgr = FileMgr('SimpleDB', 400, 8)
@@ -1137,15 +1307,57 @@ print(layout.slot_size)
 exit()
 
 
-# Catalog pages are in catalog files
-# Metadata is data that describes the database
-# Record manager needs record layout to decode the content of each block
-# record layout is an example of metadata stored by the database
-# database metadata is stored by metadata manager
-class MetadataMgr:
-    pass
+# RecoveryTest - Not mentioned the book
+fm: FileMgr = FileMgr('SimpleDB', 400, 8)
+lm: LogMgr = LogMgr(fm, 'tst_log')
+bm: BufferMgr = BufferMgr(fm, lm, 2)
 
+if fm.length('testfile'):
+    # recover
+    tx = Transaction(fm, lm, bm)
+    tx.recover()
+    print('recovery - complete')
+else:
+    # init
+    tx1 = Transaction(fm, lm, bm)
+    tx2 = Transaction(fm, lm, bm)
+    blk0 = Block('testfile', 0)
+    blk1 = Block('testfile', 1)
+    tx1.pin(blk0)
+    tx2.pin(blk1)
+    pos = 0
+    for i in range(6):
+        tx1.setInt(blk0, pos, pos, False)
+        tx2.setInt(blk1, pos, pos, False)
+        pos += 4
+    tx1.setString(blk0, 30, "abc", False)
+    tx2.setString(blk1, 30, "def", False)
+    tx1.commit()
+    tx2.commit()
 
+    # modify
+    tx3 = Transaction(fm, lm, bm)
+    tx4 = Transaction(fm, lm, bm)
+    tx3.pin(blk0)
+    tx4.pin(blk1)
+    pos = 0
+    for i in range(6):
+        tx3.setInt(blk0, pos, pos+100, True)
+        tx4.setInt(blk1, pos, pos+100, True)
+        pos += 4
+    tx3.setString(blk0, 30, 'uvw', True)
+    tx4.setString(blk1, 30, 'xyz', True)
+    # tx3.commit()
+    # tx4.commit()
+    bm.flushAll(3)
+    bm.flushAll(4)
+
+    tx3.rollback()
+
+    print('init and modify - complete')
+    for l in lm.iterator():
+        print(LogRecord.toString(l))
+exit()
 
 # Fig 5.19 ConcurrencyTest; Testing Concurrency class
 fm = FileMgr('SimpleDB', 400, 8)
