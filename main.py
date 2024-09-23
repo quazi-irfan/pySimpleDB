@@ -21,7 +21,7 @@
 # ch4 simpledb.buffer       LogMgr, LogIter, Buffer, BufferMgr
 # ch5 simpledb.tx           LogRecord, RecoveryMgr, LockTable, ConcurrencyMgr, BufferList, Transaction
 # ch6 simpledb.record       Scheme, Layout, RecordPage, RecordID, TableScan
-# ch7 simpledb.metadata
+# ch7 simpledb.metadata     TableMgr,
 # ch8 simpledb.query        Scan, Predicate
 # ch9 simpledb.parse
 # ch10 simpledb.plan
@@ -964,29 +964,44 @@ class Transaction:
 # Schema stores a list of triples (field_name, field_type, field_length)
 # {field_name : (field_type, field_length)
 class Schema:
-    def __init__(self):
+    """Maintains a list of ``{field_name:{field_type, field_byte_length}}`` for each table"""
+
+    def __init__(self, *field_data):
         self.field_info = {}
+        self.pretty_str = ''
+        if field_data:
+            for f in field_data:
+                self.addField(f[0], f[1], f[2])
 
     def addField(self, field_name, field_type, field_byte_length):
+        self.pretty_str += 'name: ' + field_name + ' type: ' + field_type + ' byte_length: ' + str(field_byte_length) + '\n'
         self.field_info[field_name] = {
-            'field_type':field_type,
-            'field_byte_length':field_byte_length if field_type == 'int' else (field_byte_length + 4)
+            'field_type': field_type,
+            'field_byte_length': field_byte_length
         }
 
     def getFields(self):
         return self.field_info.keys()
 
+    def __str__(self):
+        return self.pretty_str
+
 
 # Layout hold record's field and slot side; field offset within a slot
 class Layout:
+    """Calculates field offset from schema info"""
+
     def __init__(self, schema):
         self.schema = schema
         self.offset = {} # Holds byte offset for all fields inside a record
         field_pos = 4 # starting at 4 byte mark because the first 4 byte in the slot is allotted for empty flag
         for sk, sv in self.schema.field_info.items():
             self.offset[sk] = field_pos
-            field_pos += sv['field_byte_length']
+            field_pos += (sv['field_byte_length'] if sv['field_type'] == 'int' else (sv['field_byte_length'] + 4))
         self.slot_size = field_pos
+
+    def __str__(self):
+        return 'Layout :: \n' + str(self.schema) + 'Slot size: ' + str(self.slot_size)
 
 # file is a sequence of blocks
 # record files are a sequence of record pages/blocks
@@ -1000,7 +1015,8 @@ class Layout:
 # Record manager keeps the structure of the record(spanned/unspanned; homogeneous/nonhomogeneous) in the block
 # Implementing 6.2.1, homogeneous, unspanned, fixed-length records
 # block/page contains records, we call it record page
-class RecordPage:
+class RecordPage: # Also being called Record Manager
+    """Writes record data to a table block using layout"""
     def __init__(self, tx, blk, layout):
         self.tx: Transaction = tx
         self.blk: Block = blk
@@ -1029,6 +1045,7 @@ class RecordPage:
 
     # Zero our all records in the record page
     def format(self):
+        logging.info('Format')
         slot_index = 0
         while ((slot_index * self.layout.slot_size) + self.layout.slot_size) < self.tx.fm.block_size:
             self.tx.setInt(self.blk, slot_index * self.layout.slot_size, 0, False)
@@ -1038,6 +1055,7 @@ class RecordPage:
                 else:
                     self.tx.setString(self.blk, slot_index * self.layout.slot_size + self.layout.offset[field_name], '', False) # TODO: If we are not putting anything then recovery doesn't know what to do
             slot_index += 1
+        logging.info('Formatted')
 
     def nextEmpty(self, current_slot_index):
         return self.insertAfter(current_slot_index)
@@ -1059,7 +1077,7 @@ class RecordPage:
     def nextAfter(self, slot_index):
         slot_index += 1
         while ((slot_index * self.layout.slot_size) + self.layout.slot_size) <= self.tx.fm.block_size:
-            if tx.getInt(self.blk, slot_index * self.layout.slot_size):
+            if self.tx.getInt(self.blk, slot_index * self.layout.slot_size):
                 return slot_index
             slot_index += 1
         return -1
@@ -1090,9 +1108,12 @@ class RecordID:
 # Each record in a file can be identified by block number and slot number, these two combined is called RecordID
 # next() moves the cursor forward; it also moves to the next block if there is no more record in the current block
 class TableScan:
-    def __init__(self, tx, tbl_name, layout):
+    """Write record to table block using cursor and field name"""
+
+    def __init__(self, tx, table_name, layout):
+        """Open tbl_name file and read records at cursor"""
         self.tx = tx
-        self.table_name = tbl_name
+        self.table_name = table_name
         self.file_name = self.table_name + '.tbl'
         self.layout = layout
 
@@ -1106,7 +1127,7 @@ class TableScan:
     def moveToNewBlock(self):
         if self.rp:
             self.tx.unpin(self.rp.blk)
-        new_blk = tx.append(self.file_name)
+        new_blk = self.tx.append(self.file_name)
         self.rp = RecordPage(self.tx, new_blk, self.layout) # tx.pin(rp.blk) happening in RecordPage constructor
         self.rp.format()
         self.current_slot_index = -1
@@ -1122,7 +1143,7 @@ class TableScan:
     def nextRecord(self):
         self.current_slot_index = self.rp.nextAfter(self.current_slot_index)
         while self.current_slot_index < 0:
-            if self.rp.blk.block_number == tx.size(self.file_name) - 1:
+            if self.rp.blk.block_number == self.tx.size(self.file_name) - 1: #TODO this implies block count start at zero
                 return False
             self.moveToBlock(self.rp.blk.block_number + 1) # Moving to new block may not get us a filled out record...
             self.current_slot_index = self.rp.nextAfter(self.current_slot_index) # ...so we continue
@@ -1179,13 +1200,108 @@ class TableScan:
             self.tx.unpin(self.rp.blk)
 
 
-# Catalog pages are in catalog files
-# Metadata is data that describes the database
-# Record manager needs record layout to decode the content of each block
-# record layout is an example of metadata stored by the database
-# database metadata is stored by metadata manager
-class MetadataMgr:
-    pass
+# scheme contains field name, type and byte length
+# layout contains offset, additional padding
+# record page uses layout into to write data to a block
+# table scan uses record page to cycle through blocks in a file
+# table manager uses table scan to bind table and layout in db metadata
+class TableMgr:
+    """Create and maintain table_catalog and field_catalog for each new table"""
+    # Not using; but leaving as a reminder that all string can be of max 16 char long in the catalog tables
+    # I am using 20 because some column lengths are long, such as len('field_byte_length') = 17
+    max_name_length = 16
+
+    def __init__(self, tx, db_init):
+        self.tx = tx
+
+        self.table_catalog_schema = Schema(
+            ['table_name', 'str', 20],
+            ['slot_size', 'int', 4]
+        )
+        self.table_catalog_layout = Layout(self.table_catalog_schema) # Used in getLayoutMetadata
+
+        self.field_catalog_schema = Schema(
+            ['table_name', 'str', 20],
+            ['field_name', 'str', 20],
+            ['field_type', 'str', 4],
+            ['field_byte_length', 'int', 4],
+            ['field_byte_offset', 'int', 4]
+        )
+        self.field_catalog_layout = Layout(self.field_catalog_schema) # Used in getLayoutMetadata
+
+        # during db initialization we need to initialize these table that holds the table metadata
+        if db_init:
+            self.createTableMetadata(self.tx, 'table_catalog', self.table_catalog_schema)
+            self.createTableMetadata(self.tx, 'field_catalog', self.field_catalog_schema)
+
+    # Open the table_catalog, and field_catalog table
+    #   and append new_table metadata to those tables
+    def createTableMetadata(self, tx, new_table_name, new_sch):
+        temp_layout = Layout(new_sch)
+
+        # Add new table name and its slot size to the table_catalog table
+        table_ts = TableScan(tx, 'table_catalog', self.table_catalog_layout)
+        table_ts.nextEmptyRecord()
+        table_ts.setString('table_name', new_table_name)
+        table_ts.setInt('slot_size', temp_layout.slot_size)
+        table_ts.closeRecordPage()
+
+        # Add fields info of the new tables to field_catalog table
+        field_ts = TableScan(tx, 'field_catalog', self.field_catalog_layout)
+        for f in temp_layout.schema.getFields():
+            field_ts.nextEmptyRecord()
+            field_ts.setString('table_name', new_table_name)
+            field_ts.setString('field_name', f)
+            field_ts.setString('field_type', temp_layout.schema.field_info[f]['field_type'])
+            field_ts.setInt('field_byte_length', temp_layout.schema.field_info[f]['field_byte_length'])
+            field_ts.setInt('field_byte_offset', temp_layout.offset[f])
+        field_ts.closeRecordPage()
+
+    def getLayout(self, tx, table_name):
+        # read table_catalog and field_catalog to generate the layout for a requested table
+        ts = TableScan(tx, 'field_catalog', self.field_catalog_layout)
+        temp_sch = Schema()
+        while ts.nextRecord():
+            if ts.getString('table_name') == table_name:
+                temp_sch.addField(ts.getString('field_name'), ts.getString('field_type'), ts.getInt('field_byte_length'))
+        return Layout(temp_sch)
+
+
+# Fig 7.2 TableMgrTest: Using the TableMgr methods
+fm: FileMgr = FileMgr('SimpleDB', 400, 8)
+lm: LogMgr = LogMgr(fm, 'tst_log')
+bm: BufferMgr = BufferMgr(fm, lm, 2)
+
+tx: Transaction = Transaction(fm, lm, bm)
+sch = Schema(['A', 'int', 4], ['B', 'str', 9])
+tm: TableMgr = TableMgr(tx, True) # Create two tables; 1. table info, 2. field info for all table
+tm.createTableMetadata(tx, 'MyTable', sch)
+ly = tm.getLayout(tx, 'MyTable')
+print(ly)
+tx.commit()
+
+# exit()
+temp_tx = Transaction(fm, lm, bm)
+temp_tm = TableMgr(temp_tx, False)
+temp_ts = TableScan(temp_tx, 'table_catalog', temp_tm.table_catalog_layout)
+print("table catalog content ::")
+while temp_ts.nextRecord():
+    print(
+        temp_ts.getString('table_name'),
+        temp_ts.getInt('slot_size')
+    )
+print('field catalog content :: ')
+temp_ts = TableScan(temp_tx, 'field_catalog', temp_tm.field_catalog_layout)
+while temp_ts.nextRecord():
+    print(
+        temp_ts.getString('table_name'),
+        temp_ts.getString('field_name'),
+        temp_ts.getString('field_type'),
+        temp_ts.getInt('field_byte_length'),
+        temp_ts.getInt('field_byte_offset')
+    )
+temp_tx.commit()
+exit()
 
 
 # Fig 6.18 TableScanTest
@@ -1301,7 +1417,7 @@ sch.addField('deptid', 'int', 4)
 
 layout = Layout(sch)
 for k, v in layout.schema.field_info.items():
-    print(k, layout.offset[k])
+    print(k, v['field_byte_length'], layout.offset[k])
 print(layout.slot_size)
 
 exit()
