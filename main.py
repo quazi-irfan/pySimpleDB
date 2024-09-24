@@ -21,7 +21,7 @@
 # ch4 simpledb.buffer       LogMgr, LogIter, Buffer, BufferMgr
 # ch5 simpledb.tx           LogRecord, RecoveryMgr, LockTable, ConcurrencyMgr, BufferList, Transaction
 # ch6 simpledb.record       Scheme, Layout, RecordPage, RecordID, TableScan
-# ch7 simpledb.metadata     TableMgr, ViewMgr
+# ch7 simpledb.metadata     TableMgr, ViewMgr, StatMgr
 # ch8 simpledb.query        Scan, Predicate
 # ch9 simpledb.parse
 # ch10 simpledb.plan
@@ -1311,9 +1311,86 @@ class ViewMgr:
         while ts.nextRecord():
             if ts.getString('view_name') == view_name:
                 temp_view_def = ts.getString('view_def')
+                break
         ts.closeRecordPage()
         return temp_view_def
 
+# Replacing StatInfo with a python dictionary
+class StatMgr:
+    def __init__(self, tx, tm):
+        self.tx = tx
+        self.tm = tm
+
+        self._refreshAll = threading.Lock()
+        self._refreshOne = threading.Lock()
+        self._numcalls = 0
+        self.table_stats = {}
+        self.refreshStatistics(self.tx)
+
+    def getStatInfo(self, tx, table_name, table_layout):
+        self._numcalls += 1
+        if self._numcalls > 100:
+            self.refreshStatistics(tx)
+
+        if table_name not in self.table_stats:
+            self.table_stats[table_name] = self.calcTableStats(tx, table_name, table_layout)
+
+        return self.table_stats[table_name]
+
+    # loop over all table name in table_catalog and calculate statistics for each table
+    def refreshStatistics(self, tx):
+        with self._refreshAll:
+            self._numcalls = 0
+            temp_table_catalog_layout = self.tm.getLayout(tx, 'table_catalog')
+            ts = TableScan(tx, 'table_catalog', temp_table_catalog_layout)
+            while ts.nextRecord():
+                table_name = ts.getString('table_name')
+                table_layout = self.tm.getLayout(tx, 'table_name')
+                table_stat = self.calcTableStats(tx, table_name, table_layout)
+                self.table_stats[table_name] = table_stat
+            ts.closeRecordPage()
+
+    # Read the entire table to build table statistics
+    # distinct value is currently returns wildly inaccurate value
+    def calcTableStats(self, tx, table_name, table_layout):
+        # TODO: why same thread was not able to acquire the same lock?
+        with self._refreshOne:
+            record_count = 0
+            block_count = 0
+            ts = TableScan(tx, table_name, table_layout)
+            while ts.nextRecord():
+                record_count += 1
+                block_count = ts.rp.blk.block_number + 1
+            ts.closeRecordPage()
+            return {'block_count': block_count, 'record_count': record_count, 'distinct_val': (record_count + 1) / 3}
+
+
+# Testing StatMgr
+fm: FileMgr = FileMgr('SimpleDB', 400, 8)
+lm: LogMgr = LogMgr(fm, 'tst_log')
+bm: BufferMgr = BufferMgr(fm, lm, 8)
+tx: Transaction = Transaction(fm, lm, bm)
+tm: TableMgr = TableMgr(tx, True)
+
+student_sch = Schema(['student_name', 'str', 10], ['student_id', 'int', 4])
+tm.createTable(tx, 'student', student_sch)
+ts: TableScan = TableScan(tx, 'student', tm.getLayout(tx, 'student'))
+for i in range(100):
+    ts.nextEmptyRecord()
+    import string
+    temp_student_name = string.ascii_letters[random.randint(0, 51)] + string.ascii_letters[random.randint(0, 51)] +  string.ascii_letters[random.randint(0, 51)]
+    ts.setString('student_name', temp_student_name)
+    ts.setInt('student_id', random.randint(100, 999))
+ts.closeRecordPage()
+
+sm: StatMgr = StatMgr(tx, tm)
+print(sm.getStatInfo(tx, 'student', tm.getLayout(tx, 'student')))
+
+# ts: TableScan = TableScan(tx, 'student', tm.getLayout(tx,'student'))
+# while ts.nextRecord():
+#     print(ts.getString('student_name'), ts.getInt('student_id'))
+# ts.closeRecordPage()
+exit()
 
 # Testing ViewMgr
 fm: FileMgr = FileMgr('SimpleDB', 400, 8)
