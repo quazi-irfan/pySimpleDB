@@ -21,7 +21,7 @@
 # ch4 simpledb.buffer       LogMgr, LogIter, Buffer, BufferMgr
 # ch5 simpledb.tx           LogRecord, RecoveryMgr, LockTable, ConcurrencyMgr, BufferList, Transaction
 # ch6 simpledb.record       Scheme, Layout, RecordPage, RecordID, TableScan
-# ch7 simpledb.metadata     TableMgr,
+# ch7 simpledb.metadata     TableMgr, ViewMgr
 # ch8 simpledb.query        Scan, Predicate
 # ch9 simpledb.parse
 # ch10 simpledb.plan
@@ -991,14 +991,21 @@ class Schema:
 class Layout:
     """Calculates field offset from schema info"""
 
-    def __init__(self, schema):
+    def __init__(self, schema, offset = None, slot_size = None):
         self.schema = schema
-        self.offset = {} # Holds byte offset for all fields inside a record
-        field_pos = 4 # starting at 4 byte mark because the first 4 byte in the slot is allotted for empty flag
-        for sk, sv in self.schema.field_info.items():
-            self.offset[sk] = field_pos
-            field_pos += (sv['field_byte_length'] if sv['field_type'] == 'int' else (sv['field_byte_length'] + 4))
-        self.slot_size = field_pos
+
+        if not offset and not slot_size:
+            self.offset = {} # Holds byte offset for all fields inside a record
+            field_pos = 4 # starting at 4 byte mark because the first 4 byte is int value representing is_slot_full flag
+            for sk, sv in self.schema.field_info.items():
+                self.offset[sk] = field_pos
+                field_pos += (sv['field_byte_length'] if sv['field_type'] == 'int' else (sv['field_byte_length'] + 4))
+            self.slot_size = field_pos
+        else:
+            # we are reading everything from table_catalog and field_catalog table
+            #   therefore no calculation is necessary
+            self.offset = offset
+            self.slot_size = slot_size
 
     def __str__(self):
         return 'Layout :: \n' + str(self.schema) + 'Slot size: ' + str(self.slot_size)
@@ -1211,7 +1218,7 @@ class TableMgr:
     # I am using 20 because some column lengths are long, such as len('field_byte_length') = 17
     max_name_length = 16
 
-    def __init__(self, tx, db_init):
+    def __init__(self, tx, init_table_catalog):
         self.tx = tx
 
         self.table_catalog_schema = Schema(
@@ -1229,14 +1236,16 @@ class TableMgr:
         )
         self.field_catalog_layout = Layout(self.field_catalog_schema) # Used in getLayoutMetadata
 
-        # during db initialization we need to initialize these table that holds the table metadata
-        if db_init:
-            self.createTableMetadata(self.tx, 'table_catalog', self.table_catalog_schema)
-            self.createTableMetadata(self.tx, 'field_catalog', self.field_catalog_schema)
+        # during db initialization we need to initialize two catalog tables files that holds the metadata of all other tables
+        # these two catalog table contains their own metadata too
+        if init_table_catalog:
+            self.createTable(self.tx, 'table_catalog', self.table_catalog_schema)
+            self.createTable(self.tx, 'field_catalog', self.field_catalog_schema)
 
-    # Open the table_catalog, and field_catalog table
-    #   and append new_table metadata to those tables
-    def createTableMetadata(self, tx, new_table_name, new_sch):
+    # Create a new table in the database
+    #   This does not imply creating a new tbl file
+    #   but this implies creating appropriate entries to the table_catalog and field_catalog
+    def createTable(self, tx, new_table_name, new_sch):
         temp_layout = Layout(new_sch)
 
         # Add new table name and its slot size to the table_catalog table
@@ -1259,13 +1268,66 @@ class TableMgr:
 
     def getLayout(self, tx, table_name):
         # read table_catalog and field_catalog to generate the layout for a requested table
-        ts = TableScan(tx, 'field_catalog', self.field_catalog_layout)
+        schema_ts = TableScan(tx, 'field_catalog', self.field_catalog_layout)
         temp_sch = Schema()
-        while ts.nextRecord():
-            if ts.getString('table_name') == table_name:
-                temp_sch.addField(ts.getString('field_name'), ts.getString('field_type'), ts.getInt('field_byte_length'))
-        return Layout(temp_sch)
+        temp_offset = {}
+        while schema_ts.nextRecord():
+            if schema_ts.getString('table_name') == table_name:
+                temp_sch.addField(schema_ts.getString('field_name'), schema_ts.getString('field_type'), schema_ts.getInt('field_byte_length'))
+                temp_offset[schema_ts.getString('field_name')] = schema_ts.getInt('field_byte_offset')
+        schema_ts.closeRecordPage()
 
+        # Although Layout constructor auto initialize slot_size
+        #   we are still getting the value from table_catalog to ensure all data in layout is coming from table
+        temp_slot_size = None
+        slot_ts = TableScan(tx, 'table_catalog', self.table_catalog_layout)
+        while slot_ts.nextRecord():
+            if slot_ts.getString('table_name') == table_name:
+                temp_slot_size = slot_ts.getInt('slot_size')
+        slot_ts.closeRecordPage()
+        return Layout(temp_sch, temp_offset, temp_slot_size)
+
+class ViewMgr:
+    def __init__(self, tx : Transaction, table_mgr : TableMgr, init_view_catalog):
+        self.tx = tx
+        self.table_mgr = table_mgr
+
+        if init_view_catalog:
+            view_catalog_schema = Schema(['view_name', 'str', 20], ['view_def', 'str', 100])
+            self.table_mgr.createTable(self.tx, 'view_catalog', view_catalog_schema)
+
+    def createView(self, tx, view_name, view_def):
+        view_catalog_layout = self.table_mgr.getLayout(tx, 'view_catalog')
+        ts: TableScan = TableScan(tx, 'view_catalog', view_catalog_layout)
+        ts.nextEmptyRecord()
+        ts.setString('view_name', view_name)
+        ts.setString('view_def', view_def)
+        ts.closeRecordPage()
+
+    def getViewDef(self, tx, view_name):
+        view_catalog_layout = self.table_mgr.getLayout(tx, 'view_catalog')
+        ts: TableScan = TableScan(tx, 'view_catalog', view_catalog_layout)
+        temp_view_def = None
+        while ts.nextRecord():
+            if ts.getString('view_name') == view_name:
+                temp_view_def = ts.getString('view_def')
+        ts.closeRecordPage()
+        return temp_view_def
+
+
+# Testing ViewMgr
+fm: FileMgr = FileMgr('SimpleDB', 400, 8)
+lm: LogMgr = LogMgr(fm, 'tst_log')
+bm: BufferMgr = BufferMgr(fm, lm, 2)
+
+tx: Transaction = Transaction(fm, lm, bm)
+tm: TableMgr = TableMgr(tx, True) # Create two tables; 1. table info, 2. field info for all table
+vm: ViewMgr = ViewMgr(tx, tm, True)
+vm.createView(tx, 'get all fields','select * from field_catalog')
+print(tm.getLayout(tx, 'view_catalog'))
+print(vm.getViewDef(tx, 'get all fields'))
+tx.commit()
+exit()
 
 # Fig 7.2 TableMgrTest: Using the TableMgr methods
 fm: FileMgr = FileMgr('SimpleDB', 400, 8)
@@ -1275,12 +1337,15 @@ bm: BufferMgr = BufferMgr(fm, lm, 2)
 tx: Transaction = Transaction(fm, lm, bm)
 sch = Schema(['A', 'int', 4], ['B', 'str', 9])
 tm: TableMgr = TableMgr(tx, True) # Create two tables; 1. table info, 2. field info for all table
-tm.createTableMetadata(tx, 'MyTable', sch)
+tm.createTable(tx, 'MyTable', sch)
+
+# Equivalent to: select field_name, field_type, field_byte_length from field_catalog where table_name = 'MyTable'
 ly = tm.getLayout(tx, 'MyTable')
 print(ly)
+
 tx.commit()
 
-# exit()
+exit()
 temp_tx = Transaction(fm, lm, bm)
 temp_tm = TableMgr(temp_tx, False)
 temp_ts = TableScan(temp_tx, 'table_catalog', temp_tm.table_catalog_layout)
