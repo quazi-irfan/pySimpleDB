@@ -21,7 +21,7 @@
 # ch4 simpledb.buffer       LogMgr, LogIter, Buffer, BufferMgr
 # ch5 simpledb.tx           LogRecord, RecoveryMgr, LockTable, ConcurrencyMgr, BufferList, Transaction
 # ch6 simpledb.record       Scheme, Layout, RecordPage, RecordID, TableScan
-# ch7 simpledb.metadata     TableMgr, ViewMgr, StatMgr
+# ch7 simpledb.metadata     TableMgr, ViewMgr, StatMgr, IndexMgr, IndexInfo, MetadataMgr, SimpleDB
 # ch8 simpledb.query        Scan, Predicate
 # ch9 simpledb.parse
 # ch10 simpledb.plan
@@ -35,6 +35,7 @@ import time
 
 # debug,info,waring,error,critical
 logging.basicConfig(format='{filename}, at line {lineno}, on {threadName} {asctime}: {message}', style='{', level=logging.INFO, datefmt="%H:%M:%S")
+logging.disable(logging.INFO)
 # logging.info('db logging')
 
 class Block:
@@ -112,10 +113,16 @@ class Page:
 # Read and trigger immediate disk operation( because buffering it set to 0) to ensure data is saved to disk
 class FileMgr:
     # https://stackoverflow.com/questions/1466000/difference-between-modes-a-a-w-w-and-r-in-built-in-open-function
-    def __init__(self, db_name, block_size, buffer_size): #As of right now db_name and buffer_size is not being used
-        self.db_name = db_name,
+    def __init__(self, db_name, block_size):
+        import os
+        self.db_exists = os.path.isdir(db_name)
+        if not self.db_exists:
+            os.mkdir(os.getcwd() + '/' + db_name)
+
+        os.chdir(os.getcwd() + '/' + db_name)
+        # TODO: remove any leftover table?
+
         self.block_size = block_size
-        self.buffer_size = buffer_size
         self._lock = threading.Lock()
 
     def readBlockToPage(self, block, page):
@@ -236,7 +243,7 @@ class LogIter:
 
     def __iter__(self):
         self.temp_page = Page(self.fm.block_size)
-        fm.readBlockToPage(self.block, self.temp_page)
+        self.fm.readBlockToPage(self.block, self.temp_page)
         self.current_offset = self.temp_page.getInt(0)
         return self # returning self because in each loop self.__next__ will be called
 
@@ -326,7 +333,7 @@ class BufferMgr:
 
     def flushAll(self, at_txnum):
         with self._condition:
-            for b in bm.buffer_pool:
+            for b in self.buffer_pool:
                 if b.txnum == at_txnum:
                     b.flushDirtyBufferWithLog()
 
@@ -621,7 +628,7 @@ class RecoveryMgr:
             log_data = LogRecord.createLogRecord(l)
             op, txnum = log_data[0], log_data[1]
             if op == LogRecord.CHECKPOINT:
-                return
+                break
 
             if op == LogRecord.COMMIT or op == LogRecord.ROLLBACK:
                 completed_tx.add(txnum)
@@ -633,7 +640,7 @@ class RecoveryMgr:
 
         # Upon recovery completion; add checkpoint log
         self.bm.flushAll(self.txnum) # TODO: Flushing buffers should not be mandatory here.
-        lsn = LogRecord.writeToLog(lm = lm, op = LogRecord.CHECKPOINT)
+        lsn = LogRecord.writeToLog(lm = self.lm, op = LogRecord.CHECKPOINT)
         self.lm.flushPage(lsn)
 
     # Transaction calls these set methods to write to log
@@ -642,7 +649,7 @@ class RecoveryMgr:
     def setInt(self, target_buffer, block_offset):
         old_val = target_buffer.page.getInt(block_offset)
         return LogRecord.writeToLog(
-            lm=lm,
+            lm=self.lm,
             op=LogRecord.SETINT,
             txnum=self.txnum,
             blk_file=target_buffer.block.file_name,
@@ -654,7 +661,7 @@ class RecoveryMgr:
     def setString(self, target_buffer, block_offset):
         old_val = target_buffer.page.getStr(block_offset)
         return LogRecord.writeToLog(
-            lm=lm,
+            lm=self.lm,
             op=LogRecord.SETSTRING,
             txnum=self.txnum,
             blk_file=target_buffer.block.file_name,
@@ -786,12 +793,12 @@ class BufferList:
         self.block_pin_history = []
 
     def pin(self, target_block):
-        buf_ref = bm.pin(target_block)
+        buf_ref = self.bm.pin(target_block)
         self.block_buffer_map[target_block] = buf_ref
         self.block_pin_history.append(target_block)
 
     def unpin(self, target_block):
-        bm.unpin(self.block_buffer_map[target_block])
+        self.bm.unpin(self.block_buffer_map[target_block])
         self.block_pin_history.remove(target_block) # remove the first entry, one instance, of matching block
         if target_block not in self.block_pin_history:
             del self.block_buffer_map[target_block]
@@ -944,12 +951,12 @@ class Transaction:
     def size(self, filename):
         """call fm.length() that returns block count of a file. Acquires lock on dummy block"""
         self.cm.sLock(Block(filename, -1))
-        return fm.length(filename)
+        return self.fm.length(filename)
 
     # returns the new block references
     def append(self, filename):
         self.cm.xLock(Block(filename, -1))
-        return fm.appendEmptyBlock(filename)
+        return self.fm.appendEmptyBlock(filename)
 
     def blockSize(self):
         return self.fm.block_size
@@ -1071,8 +1078,8 @@ class RecordPage: # Also being called Record Manager
     def insertAfter(self, slot_index):
         slot_index += 1
         while ((slot_index * self.layout.slot_size) + self.layout.slot_size) <= self.tx.fm.block_size:
-            if not tx.getInt(self.blk, slot_index * self.layout.slot_size):
-                tx.setInt(self.blk, slot_index * self.layout.slot_size, 1, True) # Mark slot filled before returning it
+            if not self.tx.getInt(self.blk, slot_index * self.layout.slot_size):
+                self.tx.setInt(self.blk, slot_index * self.layout.slot_size, 1, True) # Mark slot filled before returning it
                 return slot_index
             slot_index += 1
         return -1
@@ -1115,7 +1122,7 @@ class RecordID:
 # Each record in a file can be identified by block number and slot number, these two combined is called RecordID
 # next() moves the cursor forward; it also moves to the next block if there is no more record in the current block
 class TableScan:
-    """Write record to table block using cursor and field name"""
+    """Access table file using the layout information"""
 
     def __init__(self, tx, table_name, layout):
         """Open tbl_name file and read records at cursor"""
@@ -1164,7 +1171,7 @@ class TableScan:
         self.current_slot_index = self.rp.insertAfter(self.current_slot_index)
         while self.current_slot_index < 0:
             # we reached at the end of current block
-            if self.rp.blk.block_number == tx.size(self.file_name) - 1:
+            if self.rp.blk.block_number == self.tx.size(self.file_name) - 1:
                 # this was the final block in the file, therefore append a new block to our table file
                 self.moveToNewBlock()
             else:
@@ -1288,7 +1295,7 @@ class TableMgr:
         return Layout(temp_sch, temp_offset, temp_slot_size)
 
 class ViewMgr:
-    def __init__(self, tx : Transaction, table_mgr : TableMgr, init_view_catalog):
+    def __init__(self, tx, table_mgr, init_view_catalog):
         self.tx = tx
         self.table_mgr = table_mgr
 
@@ -1316,6 +1323,7 @@ class ViewMgr:
         return temp_view_def
 
 # Replacing StatInfo with a python dictionary
+# TODO: Why we need locks when updating statistics
 class StatMgr:
     def __init__(self, tx, tm):
         self.tx = tx
@@ -1327,6 +1335,8 @@ class StatMgr:
         self.table_stats = {}
         self.refreshStatistics(self.tx)
 
+    # This method needs layout parameter
+    #   because it might need to open and parse the table to calculate the table statistics
     def getStatInfo(self, tx, table_name, table_layout):
         self._numcalls += 1
         if self._numcalls > 100:
@@ -1361,9 +1371,171 @@ class StatMgr:
             while ts.nextRecord():
                 record_count += 1
                 block_count = ts.rp.blk.block_number + 1
+                # TODO: in another nested loop read through columns to calculate their distinct value statistic
             ts.closeRecordPage()
             return {'block_count': block_count, 'record_count': record_count, 'distinct_val': (record_count + 1) / 3}
 
+class IndexMgr:
+    def __init__(self, tx, tm, sm, init_index_catalog):
+        self.tx: Transaction = tx
+        self.tm: TableMgr = tm
+        self.sm: StatMgr = sm
+
+        if init_index_catalog:
+            index_sch = Schema(['index_name', 'str', 20], ['table_name', 'str', 20],['field_name', 'str', 20])
+            self.index_layout = Layout(index_sch)
+            tm.createTable(tx, 'index_catalog', index_sch)
+
+    # Create an index over a particular column on a table
+    def createIndex(self, tx, index_name, table_name, field_name):
+        ts = TableScan(tx, 'index_catalog', self.index_layout)
+        ts.nextEmptyRecord()
+        ts.setString('index_name', index_name)
+        ts.setString('table_name', table_name)
+        ts.setString('field_name', field_name)
+        ts.closeRecordPage()
+
+    # returns all index from a table
+    # For each column with index we will get an new entry in the dictionary
+    # Return value is in form {field_name1: IndexInfo1; field_name2: IndexInfo2}
+    def getIndexInfoTable(self, tx, table_name):
+        all_index = {}
+        ts = TableScan(tx, 'index_catalog', self.index_layout)
+        while ts.nextRecord():
+            if ts.getString('table_name') == table_name:
+                temp_index_name = ts.getString('index_name')
+                temp_field_name = ts.getString('field_name')
+                index_info = IndexInfo(
+                    tx,
+                    temp_index_name,
+                    temp_field_name,
+                    ts.getString(''),
+                    self.sm.getStatInfo(tx, table_name, self.tm.getLayout(tx, table_name))
+                )
+                all_index[temp_field_name] = index_info
+        ts.closeRecordPage()
+
+# IndexInfo provides statistical info about an index; similar to StatInfo(Page 201)
+class IndexInfo:
+    def __init__(self, tx, index_name, field_name, table_layout, table_stat):
+        pass
+
+    def open(self):
+        pass
+
+    # Estimate the cost of searching using this index
+    # The cost is in the unit of required block access
+    def blocksAccessed(self):
+        pass
+
+    # number of records in the index
+    def recordsOutput(self):
+        pass
+
+class MetadataMgr:
+    def __init__(self, tx, init_db):
+        self.tx = tx
+        self.table_mgr = TableMgr(self.tx, init_db)
+        self.view_mgr = ViewMgr(self.tx, self.table_mgr, init_db)
+        self.stat_mgr = StatMgr(self.tx, self.table_mgr)
+        self.index_mgr = IndexMgr(self.tx, self.table_mgr, self.stat_mgr, init_db)
+
+    def createTable(self, tx, table_name, schema):
+        self.table_mgr.createTable(tx, table_name, schema)
+    def getLayout(self, tx, table_name):
+        return self.table_mgr.getLayout(tx, table_name)
+
+    def createView(self, tx, view_name, view_def):
+        self.view_mgr.createView(tx, view_name, view_def)
+    def getViewDef(self, tx, view_name):
+        return self.view_mgr.getViewDef(tx, view_name)
+
+    def createIndex(self, tx, index_name, table_name, field_name):
+        self.index_mgr.createIndex(tx, index_name, table_name, field_name)
+    def getIndexInfo(self, tx, table_name):
+        return self.index_mgr.getIndexInfoTable(tx, table_name)
+
+    def getStatInfo(self, tx, table_name, table_layout):
+        return self.stat_mgr.getStatInfo(tx, table_name, table_layout)
+
+class SimpleDB:
+    def __init__(self, db_name, block_size, buffer_pool_size):
+        self.fm: FileMgr = FileMgr(db_name, block_size)
+        self.lm: LogMgr = LogMgr(self.fm, db_name + '.log')
+        self.bm: BufferMgr = BufferMgr(self.fm, self.lm, buffer_pool_size)
+
+        tx: Transaction = Transaction(self.fm, self.lm, self.bm)
+        if self.fm.db_exists:
+            print('Recovering...')
+            tx.recover()
+        else:
+            print('Created new db...')
+            self.metadata = MetadataMgr(tx, True) # if db does not existes, then initialize everything
+        tx.commit()
+
+
+# 7.18 MetadataMgrTest
+db = SimpleDB('metadata_test', 400, 8)
+tx = Transaction(db.fm, db.lm, db.bm)
+student_sch = Schema(['student_name', 'str', 10], ['student_id', 'int', 4])
+db.metadata.createTable(tx, 'student', student_sch)
+
+# part 1
+print(db.metadata.getLayout(tx, 'student'))
+
+# part 2
+ts: TableScan = TableScan(tx, 'student', db.metadata.getLayout(tx, 'student'))
+for i in range(5):
+    ts.nextEmptyRecord()
+    import string
+    temp_student_name = string.ascii_letters[random.randint(0, 51)] + string.ascii_letters[random.randint(0, 51)] +  string.ascii_letters[random.randint(0, 51)]
+    ts.setString('student_name', temp_student_name)
+    ts.setInt('student_id', random.randint(100, 999))
+ts.closeRecordPage()
+print('table statistics ::')
+print(db.metadata.getStatInfo(tx,'student', db.metadata.table_mgr.getLayout(tx, 'student')))
+
+# part 3
+db.metadata.createView(tx, 'all students', 'select * from students')
+print('View :: ')
+print(db.metadata.getViewDef(tx, 'all students'))
+
+# part 4
+db.metadata.createIndex(tx, 'name_index', 'student', 'student_name')
+db.metadata.createIndex(tx, 'id_index', 'student', 'student_id')
+# TODO: Complete IndexMgr and IndexInfo before we can call db.metadata.getIndexInfo(tx, 'student')
+tx.commit()
+
+exit()
+
+# Testing IndexMgr
+fm: FileMgr = FileMgr('SimpleDB', 400, 8)
+lm: LogMgr = LogMgr(fm, 'tst_log')
+bm: BufferMgr = BufferMgr(fm, lm, 8)
+tx: Transaction = Transaction(fm, lm, bm)
+tm: TableMgr = TableMgr(tx, True)
+sm: StatMgr = StatMgr(tx, tm)
+
+student_sch = Schema(['student_name', 'str', 10], ['student_id', 'int', 4])
+tm.createTable(tx, 'student', student_sch)
+ts: TableScan = TableScan(tx, 'student', tm.getLayout(tx, 'student'))
+for i in range(100):
+    ts.nextEmptyRecord()
+    import string
+    temp_student_name = string.ascii_letters[random.randint(0, 51)] + string.ascii_letters[random.randint(0, 51)] +  string.ascii_letters[random.randint(0, 51)]
+    ts.setString('student_name', temp_student_name)
+    ts.setInt('student_id', random.randint(100, 999))
+ts.closeRecordPage()
+im: IndexMgr = IndexMgr(tx, tm, sm, True)
+
+# Create a index over a particular column on a table
+im.createIndex(tx, 'name_index', 'student', 'student_name')
+im.createIndex(tx, 'id_index', 'student', 'student_id')
+
+all_index = im.getIndexInfoTable(tx, 'student')
+for k, v in all_index.items():
+    pass
+exit()
 
 # Testing StatMgr
 fm: FileMgr = FileMgr('SimpleDB', 400, 8)
