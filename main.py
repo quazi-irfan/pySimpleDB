@@ -18,13 +18,13 @@
 # Postgresql uses 8kB as block size
 
 # ch3 simpledb.log          FileSystem: Page, Block, FileMgr
-# ch4 simpledb.buffer       Log: LogMgr, LogIter; Buffer: Buffer, BufferMgr
+# ch4 simpledb.buffer       Page: LogMgr, LogIter; Buffer: Buffer, BufferMgr
 # ch5 simpledb.tx           Transaction: LogRecord, RecoveryMgr, LockTable, ConcurrencyMgr, BufferList, Transaction
 # ch6 simpledb.record       Record: Scheme, Layout, RecordPage, RecordID, TableScan
 # ch7 simpledb.metadata     Metadata: TableMgr, ViewMgr, StatMgr, IndexMgr, IndexInfo, MetadataMgr, SimpleDB
-# ch8 simpledb.query        RelationalOperators: SelectScan, ProjectScan, ProductScan (Predicate, Term, Expression, Constant)
-# ch9 simpledb.parse        Lexer, Parser
-# ch10 simpledb.plan        TablePlan, SelectPlan, ProjectPlan, ProductScan
+# ch8 simpledb.query        RelationalOp: SelectScan, ProjectScan, ProductScan (Predicate, Term, Expression, Constant)
+# ch9 simpledb.parse        Parser: Tokenizer, (Lexer, Parser)
+# ch10 simpledb.plan        Planner: (TablePlan, SelectPlan, ProjectPlan, ProductScan, QueryPlanner, BetterQueryPlanner, UpdatePlanner)
 
 import os
 
@@ -32,6 +32,7 @@ import logging
 import random
 import threading
 import time
+import string
 
 # debug,info,waring,error,critical
 logging.basicConfig(format='{filename}, at line {lineno}, on {threadName} {asctime}: {message}', style='{', level=logging.INFO, datefmt="%H:%M:%S")
@@ -1535,8 +1536,68 @@ class ProductScan:
         self.scan1.closeRecordPage()
         self.scan2.closeRecordPage()
 
-class TokenizerTest:
-    pass
+class Tokenizer:
+    EOF = -1
+    DELIMITER = 0
+    IntConstant = 1
+    StringConstant = 2
+    Keyword = 3
+    Id = 4
+
+    def __init__(self, input):
+        self.input = input
+        self.pos = 0
+        self._tokenIndex = 0
+
+    # Keywords and identifiers are case-insensitive
+    def nextToken(self):
+        if self.pos == len(self.input):
+            return {'type': Tokenizer.EOF, 'value': Tokenizer.EOF}
+
+        while self.input[self.pos] in string.whitespace:
+            self.pos += 1
+            continue
+
+        start = self.pos
+        token_type = None
+        token_value = None
+
+        if self.pos < len(self.input) and self.input[self.pos] in string.ascii_letters:
+            while self.pos < len(self.input) and self.input[self.pos] in set(string.ascii_letters + string.digits + '_'):
+                self.pos += 1
+            if self.input[start:self.pos].lower() in ("select", "from", "where", "and", "insert", "into", "values", "delete", "update", "set", "create", "table", "int", "varchar", "view", "as", "index", "on"):
+                token_type, token_value = Tokenizer.Keyword, self.input[start:self.pos].lower()
+            else:
+                token_type, token_value = Tokenizer.Id, self.input[start:self.pos]
+
+        elif self.pos < len(self.input) and self.input[self.pos] == "'":
+            self.pos += 1 # skip the first quote since that is not part of the string
+            start = self.pos # also move the start cursor
+            while self.pos < len(self.input) and self.input[self.pos] != "'":
+                self.pos += 1
+            token_type, token_value = Tokenizer.StringConstant, self.input[start:self.pos]
+            self.pos += 1 # also ignore the final quote
+
+        elif self.pos < len(self.input) and self.input[self.pos] in string.digits:
+            while self.pos < len(self.input) and self.input[self.pos] in string.digits:
+                self.pos += 1
+            token_type, token_value = Tokenizer.IntConstant, self.input[start:self.pos]
+
+        elif self.pos < len(self.input) and self.input[self.pos] in (',', '.', '=', '(', ')'):
+            self.pos += 1
+            token_type, token_value = Tokenizer.DELIMITER, self.input[start:self.pos]
+
+        self._tokenIndex += 1
+        return {'type':token_type, 'value':token_value}
+
+
+# 9.2 TokenizerTest
+l = Tokenizer("select a from x, z where b = 3");
+token = l.nextToken()
+while token['type'] != Tokenizer.EOF:
+    print(token, l._tokenIndex)
+    token = l.nextToken()
+exit()
 
 # SimpleDB support five types of tokens
 # Single Char delimiters such as comma, period(because table.col needs to be interpreted as three tokens, table, period and column; SimpleDB doesn't do it)
