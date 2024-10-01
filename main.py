@@ -17,14 +17,14 @@
 # Each table, table index and db log are stored in a single file
 # Postgresql uses 8kB as block size
 
-# ch3 simpledb.log          Page, Block, FileMgr
-# ch4 simpledb.buffer       LogMgr, LogIter, Buffer, BufferMgr
-# ch5 simpledb.tx           LogRecord, RecoveryMgr, LockTable, ConcurrencyMgr, BufferList, Transaction
-# ch6 simpledb.record       Scheme, Layout, RecordPage, RecordID, TableScan
-# ch7 simpledb.metadata     TableMgr, ViewMgr, StatMgr, IndexMgr, IndexInfo, MetadataMgr, SimpleDB
-# ch8 simpledb.query        Scan, Predicate
-# ch9 simpledb.parse
-# ch10 simpledb.plan
+# ch3 simpledb.log          FileSystem: Page, Block, FileMgr
+# ch4 simpledb.buffer       Log: LogMgr, LogIter; Buffer: Buffer, BufferMgr
+# ch5 simpledb.tx           Transaction: LogRecord, RecoveryMgr, LockTable, ConcurrencyMgr, BufferList, Transaction
+# ch6 simpledb.record       Record: Scheme, Layout, RecordPage, RecordID, TableScan
+# ch7 simpledb.metadata     Metadata: TableMgr, ViewMgr, StatMgr, IndexMgr, IndexInfo, MetadataMgr, SimpleDB
+# ch8 simpledb.query        RelationalOperators: SelectScan, ProjectScan, ProductScan (Predicate, Term, Expression, Constant)
+# ch9 simpledb.parse        Lexer, Parser
+# ch10 simpledb.plan        TablePlan, SelectPlan, ProjectPlan, ProductScan
 
 import os
 
@@ -673,7 +673,7 @@ class RecoveryMgr:
 # LockTable grants locks to a transaction
 class LockTable:
     import collections
-    _all_locks = collections.defaultdict(int) # TODO: I do not know if there is any hidden bug for using defaultdict
+    _all_locks = collections.defaultdict(int) # TODO: check if using defaultdict is introducing any bug
 
     def __init__(self):
         self._condition = threading.Condition()
@@ -1029,6 +1029,9 @@ class Layout:
 # Record manager keeps the structure of the record(spanned/unspanned; homogeneous/nonhomogeneous) in the block
 # Implementing 6.2.1, homogeneous, unspanned, fixed-length records
 # block/page contains records, we call it record page
+
+# beforeFirst -> firstRecord; move current_slot_index to -1
+# insertAfter -> nextEmpty; move
 class RecordPage: # Also being called Record Manager
     """Writes record data to a table block using layout"""
     def __init__(self, tx, blk, layout):
@@ -1136,6 +1139,7 @@ class TableScan:
         if self.tx.size(self.file_name):
             self.moveToBlock(0)
         else:
+            # table file does not exist
             self.moveToNewBlock()
 
     def moveToNewBlock(self):
@@ -1166,7 +1170,7 @@ class TableScan:
     def nextEmptyRecord(self):
         self.insert()
 
-    # have current_slot_index point to an empty slot
+    # have current_slot_index point to next available empty slot
     def insert(self):
         self.current_slot_index = self.rp.insertAfter(self.current_slot_index)
         while self.current_slot_index < 0:
@@ -1206,8 +1210,12 @@ class TableScan:
     def setString(self, field_name, field_value):
         self.rp.setString(self.current_slot_index, field_name, field_value)
 
-    def getRecordID(self):
+    def currentRecordID(self):
         return RecordID(self.rp.blk.block_number, self.current_slot_index)
+
+
+    def hasField(self, field_name):
+        return field_name in self.layout.offset.keys()
 
     def closeRecordPage(self):
         if self.rp:
@@ -1473,6 +1481,120 @@ class SimpleDB:
             self.metadata = MetadataMgr(tx, True) # if db does not existes, then initialize everything
         tx.commit()
 
+# SQL query is turned into relational algebra query
+# Select - select rows from one table
+# project - select columns from one table
+# product - cross product between the rows of two tables
+
+# Scan interface represents the output of relational algebra query
+# Output of a query is a table
+# therefore we access the output of a relational algebra query the same way we access a table
+
+
+class SelectScan:
+    pass
+
+class ProjectScan:
+    pass
+
+class ProductScan:
+    def __init__(self, scan1, scan2):
+        self.scan1 = scan1
+        self.scan2 = scan2
+        scan1.nextRecord()
+
+    def beforeFirst(self):
+        self.scan1.beforeFirst()
+        self.scan1.nextRecord()
+        self.scan2.beforeFirst()
+
+    def nextRecord(self):
+        if s2.nextRecord():
+            return True
+        else:
+            s2.beforeFirst()
+            return s1.nextRecord() and s2.nextRecord()
+
+    def getInt(self, field_name):
+        if self.scan1.hasField(field_name):
+            return self.scan1.getInt(field_name)
+        elif self.scan2.hasField(field_name):
+            return self.scan2.getInt(field_name)
+
+
+    def getString(self, field_name):
+        if self.scan1.hasField(field_name):
+            return self.scan1.getString(field_name)
+        elif self.scan2.hasField(field_name):
+            return self.scan2.getString(field_name)
+
+    def hasField(self, field_name):
+        self.scan1.hasField(field_name) or self.scan2.hasField(field_name)
+
+    def closeRecordPage(self):
+        self.scan1.closeRecordPage()
+        self.scan2.closeRecordPage()
+
+class TokenizerTest:
+    pass
+
+# SimpleDB support five types of tokens
+# Single Char delimiters such as comma, period(because table.col needs to be interpreted as three tokens, table, period and column; SimpleDB doesn't do it)
+# Integer constants such as 123
+# String constants such as 'joe'
+# Keywords, such as select, from and where
+# Identifiers such as Student, X and glop_34a
+
+# Read one token at a time and returns its type and value
+class Lexer:
+    pass
+
+db = SimpleDB('scan_test1', 400, 8)
+tx = Transaction(db.fm, db.lm, db.bm)
+
+sA = Schema(['Aa', 'int', 4], ['Ab', 'str', 9])
+lA = Layout(sA)
+scanA = TableScan(tx, 'A', lA)
+scanA.beforeFirst()
+for i in range(3):
+    scanA.nextEmptyRecord()
+    k = random.randint(0, 50)
+    scanA.setInt('Aa', k)
+    scanA.setString('Ab', 'rec'+str(k))
+scanA.closeRecordPage()
+
+print('Content of table A')
+scanA = TableScan(tx, 'A', lA)
+while scanA.nextRecord():
+    print(scanA.getInt('Aa'), scanA.getString('Ab'))
+scanA.closeRecordPage()
+
+sB = Schema(['Ba', 'int', 4], ['Bb', 'str', 9])
+lB = Layout(sB)
+scanB = TableScan(tx, 'B', lB)
+scanB.beforeFirst()
+for i in range(3):
+    scanB.nextEmptyRecord()
+    k = random.randint(0, 50)
+    scanB.setInt('Ba', k)
+    scanB.setString('Bb', 'rec'+str(k))
+scanB.closeRecordPage()
+
+print('Content of table B')
+scanB = TableScan(tx, 'B', lB)
+while scanB.nextRecord():
+    print(scanB.getInt('Ba'), scanB.getString('Bb'))
+scanB.closeRecordPage()
+
+print('cross product between table A and B')
+s1 = TableScan(tx, 'A', lA)
+s2 = TableScan(tx, 'B', lB)
+ps = ProductScan(s1, s2)
+while ps.nextRecord():
+    print(ps.getInt('Aa'),ps.getString('Ab'),ps.getInt('Ba'),ps.getString('Bb'))
+ps.closeRecordPage()
+
+exit()
 
 # 7.18 MetadataMgrTest
 db = SimpleDB('metadata_test', 400, 8)
@@ -1640,7 +1762,7 @@ for i in range(50):
     rand_count += 1
     ts.setInt('A', temp_val)
     ts.setString('B', 'rec' + str(temp_val))
-    print('inserting ' + str(ts.getRecordID()) + '; ' + str(temp_val) + ' rec' + str(temp_val))
+    print('inserting ' + str(ts.currentRecordID()) + '; ' + str(temp_val) + ' rec' + str(temp_val))
 
 print('Deletion')
 count = 0
@@ -1650,7 +1772,7 @@ while ts.nextRecord():
     b = ts.getString('B')
     if a < 25:
         count += 1
-        print('Deleting ' + str(ts.getRecordID()) + ' ; value ' + str(a) + ' ' + b)
+        print('Deleting ' + str(ts.currentRecordID()) + ' ; value ' + str(a) + ' ' + b)
         ts.deleteRecord()
 
 print('Retained')
@@ -1658,7 +1780,7 @@ ts.firstRecord()
 while ts.nextRecord():
     a = ts.getInt('A')
     b = ts.getString('B')
-    print('Retained ' + str(ts.getRecordID()) + ' ; value ' + str(a) + ' ' + b)
+    print('Retained ' + str(ts.currentRecordID()) + ' ; value ' + str(a) + ' ' + b)
 
 ts.closeRecordPage()
 tx.commit()
