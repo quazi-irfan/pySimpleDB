@@ -1552,7 +1552,7 @@ class Tokenizer:
     # Keywords and identifiers are case-insensitive
     def nextToken(self):
         if self.pos == len(self.input):
-            return {'type': Tokenizer.EOF, 'value': Tokenizer.EOF}
+            return Tokenizer.EOF, Tokenizer.EOF
 
         while self.input[self.pos] in string.whitespace:
             self.pos += 1
@@ -1588,15 +1588,15 @@ class Tokenizer:
             token_type, token_value = Tokenizer.DELIMITER, self.input[start:self.pos]
 
         self._tokenIndex += 1
-        return {'type':token_type, 'value':token_value}
+        return token_type, token_value
 
 
 # 9.2 TokenizerTest
 l = Tokenizer("select a from x, z where b = 3");
-token = l.nextToken()
-while token['type'] != Tokenizer.EOF:
-    print(token, l._tokenIndex)
-    token = l.nextToken()
+token_type, token_value = l.nextToken()
+while token_type != Tokenizer.EOF:
+    print(l._tokenIndex, token_type, token_value)
+    token_type, token_value = l.nextToken()
 exit()
 
 # SimpleDB support five types of tokens
