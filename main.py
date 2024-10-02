@@ -2,6 +2,8 @@
 #   Final paragraph of 5.3.9.2
 # Goals
 #   Have query engine support reading other table format such as hive
+# Issues:
+#   Empty string are not initialized empty, therefore recovery won't zero out correct length (I think Book code has the same issue)
 
 # each interactino with db is a transaction
 # concurrency manager interleaves the regulation of transactions from different clients
@@ -1496,7 +1498,33 @@ class SelectScan:
     pass
 
 class ProjectScan:
-    pass
+    def __init__(self, scan, *fields):
+        self.scan = scan
+        self.fields = fields
+
+    def beforeFirst(self):
+        self.scan.beforeFirst()
+
+    def nextRecord(self):
+        return self.scan.nextRecord()
+
+    def getInt(self, field_name):
+        if field_name in self.fields:
+            return self.scan.getInt(field_name)
+        else:
+            raise Exception("Field not found")
+
+    def getString(self, field_name):
+        if field_name in self.fields:
+            return self.scan.getString(field_name)
+        else:
+            raise Exception("Field not found")
+
+    def hasField(self, field_name):
+        return field_name in self.fields
+
+    def closeRecordPage(self):
+        self.scan.closeRecordPage()
 
 class ProductScan:
     def __init__(self, scan1, scan2):
@@ -1510,11 +1538,11 @@ class ProductScan:
         self.scan2.beforeFirst()
 
     def nextRecord(self):
-        if s2.nextRecord():
+        if self.scan2.nextRecord():
             return True
         else:
-            s2.beforeFirst()
-            return s1.nextRecord() and s2.nextRecord()
+            self.scan2.beforeFirst()
+            return self.scan1.nextRecord() and self.scan2.nextRecord()
 
     def getInt(self, field_name):
         if self.scan1.hasField(field_name):
@@ -1530,7 +1558,7 @@ class ProductScan:
             return self.scan2.getString(field_name)
 
     def hasField(self, field_name):
-        self.scan1.hasField(field_name) or self.scan2.hasField(field_name)
+        return self.scan1.hasField(field_name) or self.scan2.hasField(field_name)
 
     def closeRecordPage(self):
         self.scan1.closeRecordPage()
@@ -1581,7 +1609,7 @@ class Tokenizer:
         elif self.pos < len(self.input) and self.input[self.pos] in string.digits:
             while self.pos < len(self.input) and self.input[self.pos] in string.digits:
                 self.pos += 1
-            token_type, token_value = Tokenizer.IntConstant, self.input[start:self.pos]
+            token_type, token_value = Tokenizer.IntConstant, int(self.input[start:self.pos])
 
         elif self.pos < len(self.input) and self.input[self.pos] in (',', '.', '=', '(', ')'):
             self.pos += 1
@@ -1590,14 +1618,69 @@ class Tokenizer:
         self._tokenIndex += 1
         return token_type, token_value
 
+class Lexer:
+    def __init__(self, input_query):
+        self.tokenizer = Tokenizer(input_query)
 
-# 9.2 TokenizerTest
-l = Tokenizer("select a from x, z where b = 3");
-token_type, token_value = l.nextToken()
-while token_type != Tokenizer.EOF:
-    print(l._tokenIndex, token_type, token_value)
-    token_type, token_value = l.nextToken()
-exit()
+    def matchDelim(self, target_delim):
+        type, value = self.tokenizer.nextToken()
+        return type == Tokenizer.DELIMITER and value == target_delim
+
+    def matchIntConstant(self, target_int):
+        type, value = self.tokenizer.nextToken()
+        return type == Tokenizer.IntConstant and int(value) == target_int
+
+    def matchString(self, target_string):
+        type, value = self.tokenizer.nextToken()
+        return type == Tokenizer.StringConstant and value == target_string
+
+    def matchKeyword(self, target_keyword):
+        type, value = self.tokenizer.nextToken()
+        return type == Tokenizer.Keyword and value == target_keyword
+
+    def matchId(self, target_Id):
+        type, value = self.tokenizer.nextToken()
+        return type == Tokenizer.Id and value == target_Id
+
+    def eatDelim(self, target_delim):
+        if self.matchDelim(target_delim):
+            raise Exception("SQL Syntax error")
+        return target_delim
+
+
+class Parser:
+    def __init__(self, input_query):
+        self.t : Tokenizer = Tokenizer(input_query)
+
+    def eatToken(self, target_type, target_value):
+        type, value = self.t.nextToken()
+        return type == target_type and value == target_value
+
+    def query(self):
+        self.eatToken(Tokenizer.Keyword, 'select')
+        fields = self.selectList()
+        tables = []
+        pred = None  # this needs to be Predicate()
+        return {'fields':fields, 'tables':tables, 'pred':pred}
+
+    def selectList(self):
+        pass
+
+    def field(self):
+        pass
+
+# lex = Lexer(',')
+# print(lex.matchDelim(','))
+#
+# exit()
+#
+# # 9.2 TokenizerTest
+# l = Tokenizer("select a from x, z where b = 3");
+# token_type, token_value = l.nextToken()
+# while token_type != Tokenizer.EOF:
+#     print(l._tokenIndex, token_type, token_value)
+#     token_type, token_value = l.nextToken()
+# exit()
 
 # SimpleDB support five types of tokens
 # Single Char delimiters such as comma, period(because table.col needs to be interpreted as three tokens, table, period and column; SimpleDB doesn't do it)
@@ -1606,13 +1689,11 @@ exit()
 # Keywords, such as select, from and where
 # Identifiers such as Student, X and glop_34a
 
-# Read one token at a time and returns its type and value
-class Lexer:
-    pass
-
+# ScanTest
 db = SimpleDB('scan_test1', 400, 8)
 tx = Transaction(db.fm, db.lm, db.bm)
 
+# Generate test data
 sA = Schema(['Aa', 'int', 4], ['Ab', 'str', 9])
 lA = Layout(sA)
 scanA = TableScan(tx, 'A', lA)
@@ -1622,12 +1703,6 @@ for i in range(3):
     k = random.randint(0, 50)
     scanA.setInt('Aa', k)
     scanA.setString('Ab', 'rec'+str(k))
-scanA.closeRecordPage()
-
-print('Content of table A')
-scanA = TableScan(tx, 'A', lA)
-while scanA.nextRecord():
-    print(scanA.getInt('Aa'), scanA.getString('Ab'))
 scanA.closeRecordPage()
 
 sB = Schema(['Ba', 'int', 4], ['Bb', 'str', 9])
@@ -1641,6 +1716,13 @@ for i in range(3):
     scanB.setString('Bb', 'rec'+str(k))
 scanB.closeRecordPage()
 
+# print the generated date
+print('Content of table A')
+scanA = TableScan(tx, 'A', lA)
+while scanA.nextRecord():
+    print(scanA.getInt('Aa'), scanA.getString('Ab'))
+scanA.closeRecordPage()
+
 print('Content of table B')
 scanB = TableScan(tx, 'B', lB)
 while scanB.nextRecord():
@@ -1648,13 +1730,20 @@ while scanB.nextRecord():
 scanB.closeRecordPage()
 
 print('cross product between table A and B')
-s1 = TableScan(tx, 'A', lA)
-s2 = TableScan(tx, 'B', lB)
-ps = ProductScan(s1, s2)
-while ps.nextRecord():
-    print(ps.getInt('Aa'),ps.getString('Ab'),ps.getInt('Ba'),ps.getString('Bb'))
-ps.closeRecordPage()
+scanA = TableScan(tx, 'A', lA)
+scanB = TableScan(tx, 'B', lB)
+ps: ProductScan = ProductScan(scanA, scanB) # cross product
+# reading product scan mess up the current_slot_index for the follow up scan
+# uncommenting this fixes the issue
+# while ps.nextRecord():
+#     print(scanA.current_slot_index, scanB.current_slot_index)
+#     print(ps.getInt('Aa'),ps.getString('Ab'),ps.getInt('Ba'),ps.getString('Bb'))
 
+print('project on cross product')
+pjs : ProjectScan = ProjectScan(ps, 'Aa', 'Bb')
+while pjs.nextRecord():
+    print(pjs.getInt('Aa'), pjs.getString('Bb'))
+pjs.closeRecordPage()
 exit()
 
 # 7.18 MetadataMgrTest
