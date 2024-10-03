@@ -23,9 +23,9 @@
 # ch4 simpledb.buffer       BufferPool: LogMgr, LogIter, Buffer, BufferMgr
 # ch5 simpledb.tx           Transaction: LogRecord, RecoveryMgr, LockTable, ConcurrencyMgr, BufferList, Transaction
 # ch6 simpledb.record       Record: Scheme, Layout, RecordPage, RecordID, TableScan
-# ch7 simpledb.metadata     Metadata: TableMgr, ViewMgr, StatMgr, IndexMgr, IndexInfo, MetadataMgr, SimpleDB
-# ch8 simpledb.query        RelationalOp: SelectScan, ProjectScan, ProductScan (Predicate, Term, Expression, Constant)
-# ch9 simpledb.parse        Parser: Tokenizer, (Lexer, Parser)
+# ch7 simpledb.metadata     Metadata: TableMgr, ViewMgr, StatMgr, IndexMgr, MetadataMgr, SimpleDB, (IndexInfo, StatInfo)
+# ch8 simpledb.query        RelationalOp: SelectScan, ProjectScan, ProductScan ,Predicate, Term, Expression, Constant
+# ch9 simpledb.parse        Parser: Tokenizer, Lexer, Parser
 # ch10 simpledb.plan        Planner: (TablePlan, SelectPlan, ProjectPlan, ProductScan, BasicQueryPlanner, BetterQueryPlanner, BasicUpdatePlanner, Planner)
 
 import os
@@ -1379,6 +1379,7 @@ class StatMgr:
 
     # Read the entire table to build table statistics
     # distinct value is currently returns wildly inaccurate value
+    # TODO: Once we add calculating distinct values for each fields; we also need to update TablePlan
     def calcTableStats(self, tx, table_name, table_layout):
         # TODO: why same thread was not able to acquire the same lock?
         with self._refreshOne:
@@ -1390,7 +1391,7 @@ class StatMgr:
                 block_count = ts.rp.blk.block_number + 1
                 # TODO: in another nested loop read through columns to calculate their distinct value statistic
             ts.closeRecordPage()
-            return {'block_count': block_count, 'record_count': record_count, 'distinct_val': (record_count + 1) / 3}
+            return {'blocksAccessed': block_count, 'recordsOutput': record_count, 'distinctValues': (record_count + 1) / 3}
 
 class IndexMgr:
     def __init__(self, tx, tm, sm, init_index_catalog):
@@ -1449,6 +1450,7 @@ class IndexInfo:
     def recordsOutput(self):
         pass
 
+# Facade class
 class MetadataMgr:
     def __init__(self, tx, init_db):
         self.tx = tx
@@ -1487,7 +1489,7 @@ class SimpleDB:
             tx.recover()
         else:
             print('Created new db...')
-            self.metadata = MetadataMgr(tx, True) # if db does not existes, then initialize everything
+            self.mm = MetadataMgr(tx, True) # if db does not existes, then initialize everything
         tx.commit()
 
 # SQL query is turned into relational algebra query
@@ -1567,7 +1569,6 @@ class SelectScan:
         while self.scan.nextRecord():
             if self.pred.isSatisfied(self.scan):
                 return True  # Found one
-
         return False  # No records passed the predicate
 
     def getInt(self, field_name):
@@ -1575,6 +1576,9 @@ class SelectScan:
 
     def getString(self, field_name):
         return self.scan.getString(field_name)
+
+    def getVal(self, field_name):
+        return self.scan.getVal(field_name)
 
     def hasField(self, field_name):
         return self.scan.hasField(field_name)
@@ -1634,6 +1638,12 @@ class ProductScan:
             return self.scan1.getInt(field_name)
         elif self.scan2.hasField(field_name):
             return self.scan2.getInt(field_name)
+
+    def getVal(self, field_name):
+        if self.scan1.hasField(field_name):
+            return self.scan1.getVal(field_name)
+        else:
+            return self.scan2.getVal(field_name)
 
 
     def getString(self, field_name):
@@ -1827,11 +1837,212 @@ class Parser:
             temp_list.extend(self.tableList())
         return temp_list
 
+# In the book, all *Plan classes are implementing Plan interface
+# Plan interface has the following methods;
+#   open()
+#   blocksAccessed()
+#   recordsOutput()
+#   distinctValues(field_name)
+#   schema()
+#       schema is used to verify type correctness and plan optimization
+class TablePlan:
+    def __init__(self, tx : Transaction, table_name, mm : MetadataMgr):
+        self.tx = tx
+        self.table_name = table_name
+        self.layout = mm.getLayout(self.tx, self.table_name)
+        self.table_stat = mm.getStatInfo(tx, self.table_name, self.layout)
+
+    def open(self):
+        return TableScan(self.tx, self.table_name, self.layout)
+
+    def blocksAccessed(self):
+        return self.table_stat['blocksAccessed']
+
+    def recordsOutput(self):
+        return self.table_stat['recordsOutput']
+
+    # TODO: Update this once we have distinct values for each column name
+    def distinctValues(self, field_name):
+        return self.table_stat['distinctValues']
+
+    def plan_schema(self):
+        return self.layout.schema
+
+class SelectPlan:
+    def __init__(self, plan, pred):
+        self.plan = plan
+        self.pred = pred
+
+    def open(self):
+        temp_scan = self.plan.open()
+        return SelectScan(temp_scan, self.pred)
+
+    def blocksAccessed(self):
+        return self.plan.blocksAccessed()
+
+    def recordsOutput(self):
+        return self.plan.recordsOutput()
+
+    # TODO: Update this once we have distinct values for each column name
+    def distinctValues(self, field_name):
+        return self.plan.distinctValues()
+
+    def plan_schema(self):
+        return self.plan.plan_schema()
+
+class ProjectPlan:
+    def __init__(self, plan, *fields):
+        self.plan = plan
+        self.fields = fields
+        self.schema: Schema = Schema()
+        for field_name in self.fields:
+            self.schema.addField(
+                field_name,
+                self.plan.layout.schema[field_name]['field_type'],
+                self.plan.layout.schema[field_name]['field_byte_length']
+            )
+
+    def open(self):
+        temp_scan = self.plan.open()
+        return ProjectScan(temp_scan, self.fields)
+
+    def blocksAccessed(self):
+        return self.plan.blocksAccessed()
+
+    def recordsOutput(self):
+        return self.plan.recordsOutput()
+
+    # TODO: Update this once we have distinct values for each column name
+    def distinctValues(self, field_name):
+        return self.plan.distinctValues()
+
+    def plan_schema(self):
+        return self.schema
+
+class ProductPlan:
+    def __init__(self, plan1, plan2):
+        self.plan1 = plan1
+        self.plan2 = plan2
+        self.schema = Schema()
+        self.schema.field_info = {
+            **self.plan1.plan_schema().field_info.copy(),
+            **self.plan2.plan_schema().field_info.copy()
+        }
+
+    def open(self):
+        temp_scan1 = self.plan1.open()
+        temp_scan2 = self.plan2.open()
+        return ProductScan(temp_scan1, temp_scan2)
+
+    def blocksAccessed(self):
+        pass
+
+    def recordsOutput(self):
+        pass
+
+    # TODO: Update this once we have distinct values for each column name
+    def distinctValues(self, field_name):
+        pass
+
+    def plan_schema(self):
+        return self.schema
+
+# PlanTest2
+db = SimpleDB('scan_test2', 400, 8)
+tx = Transaction(db.fm, db.lm, db.bm)
+
+sA = Schema(['Aa', 'int', 4])
+db.mm.createTable(tx, 'A', sA)
+p1 = TablePlan(tx, 'A', db.mm)
+s1 = p1.open()
+s1.beforeFirst()
+for i in [0, 1, 2]:
+    s1.nextEmptyRecord()
+    s1.setInt('Aa', i % 3)
+s1.closeRecordPage()
+
+sB = Schema(['Ba', 'int', 4])
+db.mm.createTable(tx, 'B', sB)
+p1 = TablePlan(tx, 'B', db.mm)
+s1 = p1.open()
+s1.beforeFirst()
+for i in [1, 2, 0]:
+    s1.nextEmptyRecord()
+    s1.setInt('Ba', i % 3)
+s1.closeRecordPage()
+
+# p1 = TablePlan(tx, 'A', db.mm)
+# s1 = p1.open()
+# s1.beforeFirst()
+# while s1.nextRecord():
+#     print(s1.getInt('Aa'))
+# s1.closeRecordPage()
+#
+# p1 = TablePlan(tx, 'B', db.mm)
+# s1 = p1.open()
+# s1.beforeFirst()
+# while s1.nextRecord():
+#     print(s1.getInt('Ba'))
+# s1.closeRecordPage()
+
+tA = TablePlan(tx, 'A', db.mm)
+tB = TablePlan(tx, 'B', db.mm)
+pd = ProductPlan(tA, tB)
+pred1 = Predicate(Term(Expression('Aa'), Expression(Constant(0))))
+pred2 = Predicate(Term(Expression('Ba'), Expression(Constant(1))))
+pred1.conjoinWith(pred2)
+ps = SelectPlan(pd, pred1)
+scan = ps.open()
+while scan.nextRecord():
+    print(scan.getInt('Aa'), scan.getInt('Ba'))
+scan.closeRecordPage()
+
+# Input
+# 0 1
+# 0 2
+# 0 0
+# 1 1
+# 1 2
+# 1 0
+# 2 1
+# 2 2
+# 2 0
+
+# Output
+# 0 1
+
+exit()
+
+# PlanTest1
+db = SimpleDB('scan_test1', 400, 8)
+tx = Transaction(db.fm, db.lm, db.bm)
+
+print('Creating and populating table...')
+sA = Schema(['Aa', 'int', 4], ['Ab', 'str', 9])
+db.mm.createTable(tx, 'A', sA)
+p1 = TablePlan(tx, 'A', db.mm)
+s1 = p1.open()
+s1.beforeFirst()
+for i in range(5):
+    s1.nextEmptyRecord()
+    k = random.randint(0, 50)
+    s1.setInt('Aa', k)
+    s1.setString('Ab', 'rec'+str(k))
+s1.closeRecordPage()
+
+print('Print table A')
+p1 = TablePlan(tx, 'A', db.mm)
+s1 = p1.open()
+while s1.nextRecord():
+    print(s1.getInt('Aa'), s1.getString('Ab'))
+s1.closeRecordPage()
+
+exit()
+
 # SelectScan Test
 db = SimpleDB('SelectScan', 400, 8)
 tx = Transaction(db.fm, db.lm, db.bm)
 
-# Generate test data
 sA = Schema(['Aa', 'int', 4], ['Ab', 'int', 4])
 lA = Layout(sA)
 scanA = TableScan(tx, 'A', lA)
@@ -1881,7 +2092,6 @@ exit()
 db = SimpleDB('scan_test1', 400, 8)
 tx = Transaction(db.fm, db.lm, db.bm)
 
-# Generate test data
 sA = Schema(['Aa', 'int', 4], ['Ab', 'str', 9])
 lA = Layout(sA)
 scanA = TableScan(tx, 'A', lA)
@@ -1938,13 +2148,13 @@ exit()
 db = SimpleDB('metadata_test', 400, 8)
 tx = Transaction(db.fm, db.lm, db.bm)
 student_sch = Schema(['student_name', 'str', 10], ['student_id', 'int', 4])
-db.metadata.createTable(tx, 'student', student_sch)
+db.mm.createTable(tx, 'student', student_sch)
 
 # part 1
-print(db.metadata.getLayout(tx, 'student'))
+print(db.mm.getLayout(tx, 'student'))
 
 # part 2
-ts: TableScan = TableScan(tx, 'student', db.metadata.getLayout(tx, 'student'))
+ts: TableScan = TableScan(tx, 'student', db.mm.getLayout(tx, 'student'))
 for i in range(5):
     ts.nextEmptyRecord()
     import string
@@ -1953,16 +2163,16 @@ for i in range(5):
     ts.setInt('student_id', random.randint(100, 999))
 ts.closeRecordPage()
 print('table statistics ::')
-print(db.metadata.getStatInfo(tx,'student', db.metadata.table_mgr.getLayout(tx, 'student')))
+print(db.mm.getStatInfo(tx, 'student', db.mm.table_mgr.getLayout(tx, 'student')))
 
 # part 3
-db.metadata.createView(tx, 'all students', 'select * from students')
+db.mm.createView(tx, 'all students', 'select * from students')
 print('View :: ')
-print(db.metadata.getViewDef(tx, 'all students'))
+print(db.mm.getViewDef(tx, 'all students'))
 
 # part 4
-db.metadata.createIndex(tx, 'name_index', 'student', 'student_name')
-db.metadata.createIndex(tx, 'id_index', 'student', 'student_id')
+db.mm.createIndex(tx, 'name_index', 'student', 'student_name')
+db.mm.createIndex(tx, 'id_index', 'student', 'student_id')
 # TODO: Complete IndexMgr and IndexInfo before we can call db.metadata.getIndexInfo(tx, 'student')
 tx.commit()
 
