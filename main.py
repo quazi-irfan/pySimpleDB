@@ -26,7 +26,7 @@
 # ch7 simpledb.metadata     Metadata: TableMgr, ViewMgr, StatMgr, IndexMgr, MetadataMgr, SimpleDB, (IndexInfo, StatInfo)
 # ch8 simpledb.query        RelationalOp: SelectScan, ProjectScan, ProductScan ,Predicate, Term, Expression, Constant
 # ch9 simpledb.parse        Parser: Tokenizer, Lexer, Parser
-# ch10 simpledb.plan        Planner: (TablePlan, SelectPlan, ProjectPlan, ProductScan, BasicQueryPlanner, BetterQueryPlanner, BasicUpdatePlanner, Planner)
+# ch10 simpledb.plan        Planner: TablePlan, SelectPlan, ProjectPlan, ProductScan, BasicQueryPlanner, Planner, (BetterQueryPlanner, BasicUpdatePlanner)
 
 import os
 
@@ -1577,6 +1577,7 @@ class SelectScan:
     def getString(self, field_name):
         return self.scan.getString(field_name)
 
+    # we push it up because only TabelScan has access to layout info to find if this variable is an int or str
     def getVal(self, field_name):
         return self.scan.getVal(field_name)
 
@@ -1606,6 +1607,12 @@ class ProjectScan:
     def getString(self, field_name):
         if field_name in self.fields:
             return self.scan.getString(field_name)
+        else:
+            raise Exception("Field not found")
+
+    def getVal(self, field_name):
+        if field_name in self.fields:
+            return self.scan.getVal(field_name)
         else:
             raise Exception("Field not found")
 
@@ -1810,7 +1817,7 @@ class Parser:
             temp_pred.conjoinWith(self.predicate())
         return temp_pred
 
-    def querydata(self):
+    def query(self):
         self.lex.eatKeyword('select')
         temp_fields = self.selectList()
         self.lex.eatKeyword('from')
@@ -1898,13 +1905,13 @@ class ProjectPlan:
         for field_name in self.fields:
             self.schema.addField(
                 field_name,
-                self.plan.layout.schema[field_name]['field_type'],
-                self.plan.layout.schema[field_name]['field_byte_length']
+                self.plan.plan_schema().field_info[field_name]['field_type'],
+                self.plan.plan_schema().field_info[field_name]['field_byte_length']
             )
 
     def open(self):
         temp_scan = self.plan.open()
-        return ProjectScan(temp_scan, self.fields)
+        return ProjectScan(temp_scan, *self.fields)
 
     def blocksAccessed(self):
         return self.plan.blocksAccessed()
@@ -1946,6 +1953,71 @@ class ProductPlan:
 
     def plan_schema(self):
         return self.schema
+
+# implements basic query planning algorithme explained in 10.10
+# All variants of QueryPlanner implements QueryPlanner interface
+class BasicQueryPlanner:
+    def __init__(self, mm):
+        self.mm = mm
+
+    def createPlan(self, tx, query_data):
+        all_plans = []
+        for table_name in query_data['tables']:
+            all_plans.append(TablePlan(tx, table_name, self.mm))
+
+        product_plan = all_plans[0]
+        del all_plans[0]
+        for t in all_plans:
+            product_plan = ProductPlan(t, product_plan)
+
+        select_plan = SelectPlan(product_plan, query_data['predicate'])
+
+        return ProjectPlan(select_plan, *query_data['fields'])
+
+# All updates scanners implements UpdatePlanner interface
+class BasicUpdatePlanner:
+    def __init__(self, mm):
+        self.mm = mm
+
+
+class Planner:
+    def __init__(self, query_planner, update_planner):
+        self.query_planner = query_planner
+        self.update_planner = update_planner
+
+    def createQueryPlan(self, tx, query):
+        parsed_query = Parser(query)
+        return self.query_planner.createPlan(tx, parsed_query.query())
+
+# PlannerTest
+db = SimpleDB('Plannertest', 400, 8)
+tx = Transaction(db.fm, db.lm, db.bm)
+
+sA = Schema(['Aa', 'int', 4], ['Ab', 'str', 9])
+db.mm.createTable(tx, 'A', sA)
+p1 = TablePlan(tx, 'A', db.mm)
+s1 = p1.open()
+s1.beforeFirst()
+for i in [0, 1, 2]:
+    s1.nextEmptyRecord()
+    s1.setInt('Aa', i % 3)
+    s1.setString('Ab', 'rec'+str(i))
+s1.closeRecordPage()
+
+qp = BasicQueryPlanner(db.mm)
+up = BasicUpdatePlanner(db.mm)
+p = Planner(qp, up)
+query = 'select Aa, Ab from A where Aa = 0'
+pln = p.createQueryPlan(tx, query)
+scn = pln.open()
+scn_schema = pln.plan_schema()
+while scn.nextRecord():
+    for field_name in scn_schema.field_info.keys():
+        print(scn.getVal(field_name), end=" ")
+    print()
+scn.closeRecordPage()
+
+exit()
 
 # PlanTest2
 db = SimpleDB('scan_test2', 400, 8)
