@@ -20,13 +20,13 @@
 # Postgresql uses 8kB as block size
 
 # ch3 simpledb.log          FileSystem: Page, Block, FileMgr
-# ch4 simpledb.buffer       Page: LogMgr, LogIter; Buffer: Buffer, BufferMgr
+# ch4 simpledb.buffer       BufferPool: LogMgr, LogIter, Buffer, BufferMgr
 # ch5 simpledb.tx           Transaction: LogRecord, RecoveryMgr, LockTable, ConcurrencyMgr, BufferList, Transaction
 # ch6 simpledb.record       Record: Scheme, Layout, RecordPage, RecordID, TableScan
 # ch7 simpledb.metadata     Metadata: TableMgr, ViewMgr, StatMgr, IndexMgr, IndexInfo, MetadataMgr, SimpleDB
 # ch8 simpledb.query        RelationalOp: SelectScan, ProjectScan, ProductScan (Predicate, Term, Expression, Constant)
 # ch9 simpledb.parse        Parser: Tokenizer, (Lexer, Parser)
-# ch10 simpledb.plan        Planner: (TablePlan, SelectPlan, ProjectPlan, ProductScan, QueryPlanner, BetterQueryPlanner, UpdatePlanner)
+# ch10 simpledb.plan        Planner: (TablePlan, SelectPlan, ProjectPlan, ProductScan, BasicQueryPlanner, BetterQueryPlanner, BasicUpdatePlanner, Planner)
 
 import os
 
@@ -1207,6 +1207,12 @@ class TableScan:
     def getString(self, field_name):
         return self.rp.getString(self.current_slot_index, field_name)
 
+    def getVal(self, field_name):
+        if self.layout.schema.field_info[field_name]['field_type'] == 'int':
+            return self.getInt(field_name)
+        else:
+            return self.getString(field_name)
+
     def setInt(self, field_name, field_value):
         self.rp.setInt(self.current_slot_index, field_name, field_value)
 
@@ -1493,9 +1499,88 @@ class SimpleDB:
 # Output of a query is a table
 # therefore we access the output of a relational algebra query the same way we access a table
 
+class Constant:
+    def __init__(self, const_value):
+        self.const_value = const_value
+
+class Expression:
+    def __init__(self, exp_value):
+        self.exp_value = exp_value
+
+    def evaluate(self, scan):
+        if isinstance(self.exp_value, Constant):
+            return self.exp_value.const_value
+        else:
+            return scan.getVal(self.exp_value)
+
+class Term:
+    def __init__(self, lhs, rhs):
+        self.lhs = lhs
+        self.rhs = rhs
+
+    def isSatisfied(self, scan):
+        return self.lhs.evaluate(scan) == self.rhs.evaluate(scan)
+
+    def reductionFactor(self, plan):
+        pass
+
+    def equatesWithConstant(self, field_name):
+        pass
+
+    def equatesWithField(self, const_value):
+        pass
+
+class Predicate:
+    def __init__(self, term=None):
+        self.terms = []
+        if term:
+            self.terms.append(term)
+
+    def conjoinWith(self, pred):
+        self.terms.extend(pred.terms)
+
+    def isSatisfied(self, scan):
+        for t in self.terms:
+            if not t.isSatisfied(scan):
+                return False
+        return True
+
+    def reductionFactor(self, plan):
+        pass
+
+    def equatesWithConstant(self, field_name):
+        pass
+
+    def equatesWithField(self, const_value):
+        pass
 
 class SelectScan:
-    pass
+    def __init__(self, scan, pred):
+        self.scan = scan
+        self.pred = pred
+
+    def beforeFirst(self):
+        self.scan.beforeFirst()
+
+    def nextRecord(self):
+        # continue fetching records until we get one that satisfies the predicate
+        while self.scan.nextRecord():
+            if self.pred.isSatisfied(self.scan):
+                return True  # Found one
+
+        return False  # No records passed the predicate
+
+    def getInt(self, field_name):
+        return self.scan.getInt(field_name)
+
+    def getString(self, field_name):
+        return self.scan.getString(field_name)
+
+    def hasField(self, field_name):
+        return self.scan.hasField(field_name)
+
+    def closeRecordPage(self):
+        self.scan.closeRecordPage()
 
 class ProjectScan:
     def __init__(self, scan, *fields):
@@ -1564,6 +1649,12 @@ class ProductScan:
         self.scan1.closeRecordPage()
         self.scan2.closeRecordPage()
 
+# SimpleDB support five types of tokens
+# Single Char delimiters such as comma, period(because table.col needs to be interpreted as three tokens, table, period and column; SimpleDB doesn't do it)
+# Integer constants such as 123
+# String constants such as 'joe'
+# Keywords, such as select, from and where
+# Identifiers such as Student, X and glop_34a
 class Tokenizer:
     EOF = -1
     DELIMITER = 0
@@ -1571,6 +1662,8 @@ class Tokenizer:
     StringConstant = 2
     Keyword = 3
     Id = 4
+    KEYWORD_LIST = ("select", "from", "where", "and", "insert", "into", "values", "delete", "update",
+                "set", "create", "table", "int", "varchar", "view", "as", "index", "on")
 
     def __init__(self, input):
         self.input = input
@@ -1593,7 +1686,7 @@ class Tokenizer:
         if self.pos < len(self.input) and self.input[self.pos] in string.ascii_letters:
             while self.pos < len(self.input) and self.input[self.pos] in set(string.ascii_letters + string.digits + '_'):
                 self.pos += 1
-            if self.input[start:self.pos].lower() in ("select", "from", "where", "and", "insert", "into", "values", "delete", "update", "set", "create", "table", "int", "varchar", "view", "as", "index", "on"):
+            if self.input[start:self.pos].lower() in Tokenizer.KEYWORD_LIST:
                 token_type, token_value = Tokenizer.Keyword, self.input[start:self.pos].lower()
             else:
                 token_type, token_value = Tokenizer.Id, self.input[start:self.pos]
@@ -1621,59 +1714,161 @@ class Tokenizer:
 class Lexer:
     def __init__(self, input_query):
         self.tokenizer = Tokenizer(input_query)
+        self.token_type, self.token_value = self.tokenizer.nextToken()
 
     def matchDelim(self, target_delim):
-        type, value = self.tokenizer.nextToken()
-        return type == Tokenizer.DELIMITER and value == target_delim
+        return self.token_value == target_delim
 
-    def matchIntConstant(self, target_int):
-        type, value = self.tokenizer.nextToken()
-        return type == Tokenizer.IntConstant and int(value) == target_int
+    def matchIntConstant(self):
+        return self.token_type == Tokenizer.IntConstant
 
-    def matchString(self, target_string):
-        type, value = self.tokenizer.nextToken()
-        return type == Tokenizer.StringConstant and value == target_string
+    def matchStringConstant(self):
+        return self.token_type == Tokenizer.StringConstant
 
     def matchKeyword(self, target_keyword):
-        type, value = self.tokenizer.nextToken()
-        return type == Tokenizer.Keyword and value == target_keyword
+        return self.token_type == Tokenizer.Keyword and self.token_value == target_keyword
 
-    def matchId(self, target_Id):
-        type, value = self.tokenizer.nextToken()
-        return type == Tokenizer.Id and value == target_Id
+    def matchId(self):
+        return self.token_type == Tokenizer.Id and self.token_value not in Tokenizer.KEYWORD_LIST
+
 
     def eatDelim(self, target_delim):
-        if self.matchDelim(target_delim):
-            raise Exception("SQL Syntax error")
-        return target_delim
+        if not self.matchDelim(target_delim):
+            raise Exception("Expecting delimiter " + str(target_delim))
+        self.token_type, self.token_value = self.tokenizer.nextToken()
+        # delimiters are consumed
+
+    def eatIntConstant(self):
+        if not self.matchIntConstant():
+            raise Exception("Expecting Int Constant")
+        temp = self.token_value
+        self.token_type, self.token_value = self.tokenizer.nextToken()
+        return temp
+
+    def eatStringConstant(self):
+        if not self.matchStringConstant():
+            raise Exception("Expecting String constant")
+        temp = self.token_value
+        self.token_type, self.token_value = self.tokenizer.nextToken()
+        return temp
+
+    def eatKeyword(self, target_keyword):
+        if not self.matchKeyword(target_keyword):
+            raise Exception("Expecting SQL keyword")
+        temp = self.token_value
+        self.token_type, self.token_value = self.tokenizer.nextToken()
+        return temp
+
+    def eatId(self):
+        if not self.matchId():
+            raise Exception("Expecting SQL Identifier")
+        temp = self.token_value
+        self.token_type, self.token_value = self.tokenizer.nextToken()
+        return temp
 
 
 class Parser:
     def __init__(self, input_query):
-        self.t : Tokenizer = Tokenizer(input_query)
-
-    def eatToken(self, target_type, target_value):
-        type, value = self.t.nextToken()
-        return type == target_type and value == target_value
-
-    def query(self):
-        self.eatToken(Tokenizer.Keyword, 'select')
-        fields = self.selectList()
-        tables = []
-        pred = None  # this needs to be Predicate()
-        return {'fields':fields, 'tables':tables, 'pred':pred}
-
-    def selectList(self):
-        pass
+        self.lex: Lexer = Lexer(input_query)
 
     def field(self):
-        pass
+        return self.lex.eatId()
 
-# lex = Lexer(',')
-# print(lex.matchDelim(','))
-#
-# exit()
-#
+    def constant(self):
+        # TODO: internally string and int are handled no differently
+        if self.lex.matchStringConstant():
+            return Constant(self.lex.eatStringConstant())
+        else:
+            return Constant(self.lex.eatIntConstant())
+    def expression(self):
+        if self.lex.matchId():
+            return Expression(self.field())
+        else:
+            return Expression(self.constant())
+
+    def term(self):
+        temp_lhs = self.expression()
+        self.lex.eatDelim('=')
+        temp_rhs = self.expression()
+        return Term(temp_lhs, temp_rhs)
+
+    # predicate is one or more terms conjoined by AND operator
+    def predicate(self):
+        temp_pred = Predicate(self.term())
+        if self.lex.matchKeyword('and'):
+            self.lex.eatKeyword('and')
+            temp_pred.conjoinWith(self.predicate())
+        return temp_pred
+
+    def querydata(self):
+        self.lex.eatKeyword('select')
+        temp_fields = self.selectList()
+        self.lex.eatKeyword('from')
+        temp_tables = self.tableList()
+        temp_pred = Predicate()
+        if self.lex.matchKeyword('where'):
+            self.lex.eatKeyword('where')
+            temp_pred = self.predicate()
+        return {'fields':temp_fields, 'tables':temp_tables, 'predicate':temp_pred}
+
+    def selectList(self):
+        temp_list = []
+        temp_list.append(self.field())
+        while self.lex.matchDelim(','):
+            self.lex.eatDelim(',')
+            temp_list.extend(self.selectList())
+        return temp_list
+
+    def tableList(self):
+        temp_list = []
+        temp_list.append(self.lex.eatId()) # self.lex.eatId() is equivalent to self.field()
+        if self.lex.matchDelim(','):
+            self.lex.eatDelim(',')
+            temp_list.extend(self.tableList())
+        return temp_list
+
+# SelectScan Test
+db = SimpleDB('SelectScan', 400, 8)
+tx = Transaction(db.fm, db.lm, db.bm)
+
+# Generate test data
+sA = Schema(['Aa', 'int', 4], ['Ab', 'int', 4])
+lA = Layout(sA)
+scanA = TableScan(tx, 'A', lA)
+scanA.beforeFirst()
+counter = 0
+for i in range(10):
+    scanA.nextEmptyRecord()
+    scanA.setInt('Aa', counter % 3)
+    counter += 1
+    scanA.setInt('Ab', counter % 3)
+scanA.closeRecordPage()
+
+# temp_scan = TableScan(tx, 'A', lA)
+# while temp_scan.nextRecord():
+#     print(temp_scan.getInt('Aa'), temp_scan.getInt('Ab'))
+# temp_scan.closeRecordPage()
+
+lhs = Expression('Aa')
+rhs = Expression(Constant(0))
+t1 = Term(lhs, rhs)
+p1 = Predicate(t1)
+
+lhs2 = Expression('Ab')
+rhs2 = Expression(Constant(1))
+t2 = Term(lhs2, rhs2)
+p2 = Predicate(t2)
+p1.conjoinWith(p2)
+
+# select Aa, Ab from A where Aa = 0 and Ab = 1
+scanA = TableScan(tx, 'A', lA)
+ss = SelectScan(scanA, p1)
+while ss.nextRecord():
+    print(ss.getInt('Aa'), ss.getInt('Ab'))
+ss.closeRecordPage()
+exit()
+
+
 # # 9.2 TokenizerTest
 # l = Tokenizer("select a from x, z where b = 3");
 # token_type, token_value = l.nextToken()
@@ -1681,13 +1876,6 @@ class Parser:
 #     print(l._tokenIndex, token_type, token_value)
 #     token_type, token_value = l.nextToken()
 # exit()
-
-# SimpleDB support five types of tokens
-# Single Char delimiters such as comma, period(because table.col needs to be interpreted as three tokens, table, period and column; SimpleDB doesn't do it)
-# Integer constants such as 123
-# String constants such as 'joe'
-# Keywords, such as select, from and where
-# Identifiers such as Student, X and glop_34a
 
 # ScanTest
 db = SimpleDB('scan_test1', 400, 8)
