@@ -1,6 +1,6 @@
 ### pySimpleDB
 
-This is a python (partial) implementation of SimpleDB, an educational database.
+This is a python (partial) implementation of SimpleDB, an educational database, authored by Edward Sciore.
 
 ### Features
 - Uses Heap file and buffer pool to minimize disk seek
