@@ -23,7 +23,7 @@
 # ch4 simpledb.buffer       BufferPool: LogMgr, LogIter, Buffer, BufferMgr
 # ch5 simpledb.tx           Transaction: LogRecord, RecoveryMgr, LockTable, ConcurrencyMgr, BufferList, Transaction
 # ch6 simpledb.record       Record: Scheme, Layout, RecordPage, RecordID, TableScan
-# ch7 simpledb.metadata     Metadata: TableMgr, ViewMgr, StatMgr, IndexMgr, MetadataMgr, SimpleDB, (IndexInfo, StatInfo)
+# ch7 simpledb.metadata     Metadata: TableMgr, ViewMgr, StatMgr, IndexMgr, MetadataMgr, (SimpleDB, IndexInfo, StatInfo)
 # ch8 simpledb.query        RelationalOp: SelectScan, ProjectScan, ProductScan ,Predicate, Term, Expression, Constant
 # ch9 simpledb.parse        Parser: Tokenizer, Lexer, Parser
 # ch10 simpledb.plan        Planner: TablePlan, SelectPlan, ProjectPlan, ProductScan, BasicQueryPlanner, Planner, (BetterQueryPlanner, BasicUpdatePlanner)
