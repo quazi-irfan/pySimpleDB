@@ -1,6 +1,6 @@
 ### pySimpleDB
 
-This is a python implementation of SimpleDB, authored by Edward Sciore.
+This is a python implementation of SimpleDB, originally authored by Edward Sciore[1, 2].
 
 ### Features
 - Uses Heap file and buffer pool to minimize disk seek
@@ -16,10 +16,11 @@ This is a python implementation of SimpleDB, authored by Edward Sciore.
 - Supported data types
   - 4 bit integer and fixed length string
 - SQL Support
+  - Supported Relational operators: Project, Product, Select
   - Select statement with Where clause with multiple predicate(equality operator only)
   - Simplified form of Create, Update and Delete statement
 
 ### References
-- Book [Database Design and Implementation by Edward Sciore](https://link.springer.com/book/10.1007/978-3-030-33836-7)
-- Article [SimpleDB: a simple java-based multiuser syst for teaching database internals](https://dl.acm.org/doi/abs/10.1145/1227504.1227498)
+- [1] Book [Database Design and Implementation by Edward Sciore](https://link.springer.com/book/10.1007/978-3-030-33836-7)
+- [2] Article [SimpleDB: a simple java-based multiuser syst for teaching database internals](https://dl.acm.org/doi/abs/10.1145/1227504.1227498)
 
