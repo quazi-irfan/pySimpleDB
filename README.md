@@ -8,7 +8,7 @@ This is a python implementation of [SimpleDB](https://cs.bc.edu/~sciore/simpledb
     - Supports concurrent user using concurrent transactions
     - Transactions adhear to serializable isolation level
     - Uses a variant of two phase locking
-    - Locks(Both soft and hard) are acquired on demand, and all released at transcation commit
+    - Locks(Both soft and hard) are acquired on demand, and all released at transcation commit/rollback
 - Recovery
   - Write ahead log for recovery
   - Recovery manager peforms undo operation on all uncommited transactions during database startup
