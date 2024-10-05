@@ -3,6 +3,16 @@ import threading
 import logging
 db_logger = logging.getLogger('SimpleDB')
 
+# file system allows accessing raw disk in blocks.
+# in db, each file is treated like a raw disk
+# db access each file by virtual blocks(OR translates these blocks into physical blocks using file system)
+# db reads block into pages
+# db maintain a pool of pages in memory
+# db read and write is done on those poled pages
+# By only operating in memory, db can control when writing to disk is happening
+# Each table, table index and db log are stored in a single file
+# Postgresql uses 8kB as block size
+
 class Block:
     def __init__(self, file_name, block_number):
         self.file_name = file_name
