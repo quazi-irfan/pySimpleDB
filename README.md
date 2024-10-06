@@ -6,12 +6,12 @@ This is a python implementation of [SimpleDB](https://cs.bc.edu/~sciore/simpledb
 - ACID Compliance
     - Atomicity and Durability is implemented using Logging and Recovery manager
     - Consistency is implemented using runtime check in the query planner
-    - Isolation is implemented using Serializing transactions using Locking
+    - Isolation is implemented by Serializing transactions
 - Uses Heap file and buffer pool to minimize disk seek
 - Concurrent Transactions Support
     - Supports multiple user simultaneously using concurrent transactions
-    - Serializability of concurrent transactions is encofrced using a variant of two phase locking
-    - In this varaient, locks are acquired on demand, and all released at transcation completion
+    - Serializability of concurrent transactions is enforced using a variant of two phase locking
+    - In this varaient, locks(shared and exclusive) are acquired on demand, and all released at transcation completion
 - Recovery Manager
   - Write ahead log for recovery
   - Recovery manager peforms undo operation on all uncommited transactions during database startup
