@@ -1,8 +1,12 @@
 ### pySimpleDB
 
-This is a python implementation of [SimpleDB](https://cs.bc.edu/~sciore/simpledb/), originally authored by [Edward Sciore](https://www.bc.edu/bc-web/schools/morrissey/departments/computer-science/people/faculty-directory/edward-sciore.html)[1, 2].
+This is a python implementation of [SimpleDB](https://cs.bc.edu/~sciore/simpledb/), originally authored by [Edward Sciore](https://www.bc.edu/bc-web/schools/morrissey/departments/computer-science/people/faculty-directory/edward-sciore.html)[1, 2]. This database is ACID compliant.
 
 ### Features
+- ACID Compliance
+    - Atomicity and Durability is implemented using Logging and Recovery manager.
+    - Consistency is implemented using runtime check in the query planner
+    - Isolation is implemented using Locking
 - Uses Heap file and buffer pool to minimize disk seek
 - Concurrent Transactions
     - Supports concurrent user using concurrent transactions
