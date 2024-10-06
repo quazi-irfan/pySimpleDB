@@ -9,7 +9,7 @@ This is a python implementation of [SimpleDB](https://cs.bc.edu/~sciore/simpledb
     - Isolation is implemented using Locking
 - Uses Heap file and buffer pool to minimize disk seek
 - Concurrent Transactions
-    - Supports concurrent user using concurrent transactions
+    - Supports multiple user simultaneously using concurrent transactions
     - Transactions adhear to serializable isolation level
     - Uses a variant of two phase locking
     - Locks(Both soft and hard) are acquired on demand, and all released at transcation commit/rollback
