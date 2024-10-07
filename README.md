@@ -12,10 +12,14 @@ This is a python implementation of [SimpleDB](https://cs.bc.edu/~sciore/simpledb
     - Supports multiple user simultaneously using concurrent transactions
     - Serializability of concurrent transactions is enforced using a variant of two phase locking
     - In this varaient, locks(shared and exclusive) are acquired on demand, and all released at transcation completion
+    - Locks are acquired on blocks
 - Recovery Manager
   - Write ahead log for recovery
   - Recovery manager peforms undo operation on all uncommited transactions during database startup
   - Log files gets very large, but recovery manager only reads until a quiescent checkpoint
+- Log Manager
+  - Write value to a field generates log entry recording the prior value
+  - This prior value is used by Recovery manager to undo all uncommited transactions
 - SQL Support
   - 4 bit integer and fixed length string
   - Supported Relational operators: Project, Product, Select
