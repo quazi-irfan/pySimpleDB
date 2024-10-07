@@ -18,7 +18,7 @@ This is a python implementation of [SimpleDB](https://cs.bc.edu/~sciore/simpledb
   - Recovery manager peforms undo operation on all uncommited transactions during database startup
   - Log files gets very large, but recovery manager only reads until a quiescent checkpoint
 - Log Manager
-  - Write value to a field generates log entry recording the prior value
+  - Each modication to a field generates a log entry capturing the prior value of the field
   - This prior value is used by Recovery manager to undo all uncommited transactions
 - SQL Support
   - 4 bit integer and fixed length string
