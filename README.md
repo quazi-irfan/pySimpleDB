@@ -7,7 +7,9 @@ This is a python implementation of [SimpleDB](https://cs.bc.edu/~sciore/simpledb
     - Atomicity and Durability is implemented using Logging and Recovery manager
     - Consistency is implemented using runtime check in the query planner
     - Isolation is implemented by Serializing transactions
-- Uses Heap file and buffer pool to minimize disk seek
+- Storage and Buffer Pool
+  - Files are treated as raw disk and part of file(blocks) are paged into memory
+  - Buffer pool maintins a fixed number of in-memory blocks(pages) to minimize disk seek
 - Concurrent Transactions Support
     - Supports multiple user simultaneously using concurrent transactions
     - Serializability of concurrent transactions is enforced using a variant of two phase locking
