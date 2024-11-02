@@ -133,11 +133,13 @@ class BasicQueryPlanner:
 
         return ProjectPlan(select_plan, *query_data['fields'])
 
+class BetterQueryPlanner:
+    pass
+
 # All updates scanners implements UpdatePlanner interface
 class BasicUpdatePlanner:
     def __init__(self, mm):
         self.mm = mm
-
 
 class Planner:
     def __init__(self, query_planner, update_planner):
@@ -146,4 +148,9 @@ class Planner:
 
     def createQueryPlan(self, tx, query):
         parsed_query = Parser(query)
-        return self.query_planner.createPlan(tx, parsed_query.query())
+        # TODO: Verify Consistency of ACID; meaning that query is valid to run, such as type checking
+        # TODO: Verify the user is authorized to run, table access permission
+
+        # TODO: Query rewrite during optimization; such as using BetterQueryPlanner.createPlan()
+        query_plan = self.query_planner.createPlan(tx, parsed_query.query())
+        return query_plan

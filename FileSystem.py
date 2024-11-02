@@ -105,8 +105,7 @@ class FileMgr:
 
     def readBlockToPage(self, block, page):
         with self._lock:
-            self.length(
-                block.file_name)  # TODO: hack to create an emptyÎ file if none exists; this needs to be replaced with a list of file handle that cache opened file handles
+            self.length(block.file_name)  # TODO: hack to create an emptyÎ file if none exists; this needs to be replaced with a list of file handle that cache opened file handles
             f = open(block.file_name, 'rb', buffering=0)  # Does buffering has any effect on reading?
             f.seek(self.block_size * block.block_number)
             # Making sure we are only reading the block size of the file
@@ -125,6 +124,7 @@ class FileMgr:
     # if file does not exist we create a new one
     def writePageToBlock(self, block, page):
         with self._lock:
+            self.length(block.file_name) # TODO: hack to create an emptyÎ file if none exists; this needs to be replaced with a list of file handle that cache opened file handles
             db_logger.info('Disk write of ' + str(block))
             f = open(block.file_name, 'r+b', buffering=0)  # r is used because a prevents seek and w truncates the file
             f.seek(self.block_size * block.block_number)
@@ -152,3 +152,22 @@ class FileMgr:
             with open(file_name, 'wb', buffering=0):
                 pass
             return 0  # New file don't have any block in it
+
+# 3.12 Testing file manager
+# File for each table; many blocks(identified by id) for each file
+# these files needs to be created inside a folded named $db
+if __name__ == '__main__':
+    fm = FileMgr('filetest', 400)  # Kernel page size; usually 4096 bytes
+    from BufferPool import LogMgr
+    lm = LogMgr(fm, 'simpledb.log')
+    b1 = Block('testfile', 2)
+    p1 = Page(fm.block_size)
+    pos = 88  # position relative to the current block, so should always be between 0 <= block_size < 400
+    new_pos = pos + p1.setData(pos, 'abcdefghijklm')
+    p1.setData(new_pos, 345)
+    fm.writePageToBlock(b1, p1)  # won't work because r+b is expecting the file to exists; in LogTest we are creating the empty file in appendEmptyBlock
+
+    temp_page = Page(fm.block_size)
+    fm.readBlockToPage(b1, temp_page)
+    print(temp_page.getStr(pos))
+    print(temp_page.getInt(new_pos))

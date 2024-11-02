@@ -280,6 +280,9 @@ class RecoveryMgr:
         )
 
 # LockTable grants locks to a transaction
+# This class in instantiated only once
+# And that single instance is referenced by all instance of concurrency manager
+#   This global variable is used all transactions to request and release locks for all Tx
 class LockTable:
     import collections
     _all_locks = collections.defaultdict(int) # TODO: check if using defaultdict is introducing any bug
