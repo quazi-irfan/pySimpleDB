@@ -222,8 +222,99 @@ class BufferMgr:
         return None
 
     # requested block is not already in the buffer pool; so find an unpinned buffer
+    # https://ksiresearch.org/seke/seke22paper/paper141.pdf
     def chooseUnpinnedBuffer(self):
         for b in self.buffer_pool:
             if not b.pin_count > 0:  # TODO: pin_count = 0 implies no tx pinned any block to this buffer yet
                 return b
         return None
+
+if __name__ == '__main__':
+    fig = [4.5, 4.11, 4.12][2]
+
+    if fig == 4.12:
+        # Fig 4.12 Testing Buffer Manager
+        fm: FileMgr = FileMgr('simpledb', 400)
+        lm: LogMgr = LogMgr(fm, 'simpledb.log')
+        bm: BufferMgr = BufferMgr(fm, lm, 3)
+        buff = []  # we will append six BLock references in this list
+        buff.append(bm.pin(Block('testfile', 0)))
+        buff.append(bm.pin(Block('testfile', 1)))
+        buff.append(bm.pin(Block('testfile', 2)))
+        bm.unpin(buff[1])  # unpin testfile, 1
+        buff[1] = None
+        buff.append(bm.pin(Block('testfile', 0)))  # no effect
+        buff.append(bm.pin(Block('testfile', 1)))  # pin testfile, 1 again
+        print('Available buffer count: ' + str(bm.pool_availability))
+        try:
+            print("Attempting to pin block 3...")
+            buff.append(bm.pin(Block('testfile', 3)))
+        except Exception as e:
+            print("Exception: " + str(e))
+        bm.unpin(buff[2])  # unpin testfile, 2
+        buff[2] = None
+        buff.append(bm.pin(Block('testfile', 3)))  # pin testfile, 3
+
+        print("Final buffer allocation.")
+        for i in range(len(buff)):
+            if buff[i]:
+                print('buff[' + str(i) + '] pinned to block ' + str(buff[i].block))
+
+    elif fig == 4.11:
+        # Fig 4.11 Testing Buffer
+        fm = FileMgr('simpledb', 400)
+        lm = LogMgr(fm, 'simpledb.log')
+        bm = BufferMgr(fm, lm, 3)
+        buff1 = bm.pin(Block('testfile', 1))
+        n = buff1.page.getInt(80)  # it should return empty because testfile is of size zero
+        buff1.page.setData(80, n + 1)
+        buff1.setModified(1, 0)  # does lsn start at zero?
+        print('The new value is ', n + 1)
+        bm.unpin(buff1)  # we do not immediately write it back to disk because some other client might pin it again
+
+        buff2 = bm.pin(Block('testfile', 2))  # this write the block 1 back to disk
+        buff3 = bm.pin(Block('testfile', 3))
+        buff4 = bm.pin(Block('testfile', 4))
+
+        bm.unpin(buff2)
+        buff11 = bm.pin(Block('testfile', 1))
+        buff11.page.setData(80, 9999)
+        buff11.setModified(1, 0)
+        buff11.unpin()  # This modification won't get written to disk because there is noting forcing it
+        bm.flushAll(2)
+
+    elif fig == 4.5:
+        # Fig 4.5 Testing Log Manager
+        fm = FileMgr('simpledb', 400)  # Kernel page size; usually 4096 bytes
+        lm = LogMgr(fm, 'simpledb.log')
+
+        def createLogRecord(s, i):
+            temp_bytearray = bytearray(4 + len(s) + 4)  # length of string + string + one number
+            temp_page = Page(temp_bytearray)  # creating page with desired size because
+            pos = temp_page.setData(0, s)
+            temp_page.setData(pos, i)
+            lsn = lm.appendLog(temp_page.bb)
+            return lsn
+
+
+        for i in range(1, 36):
+            lsn = createLogRecord('record' + str(i), i + 100)
+            print('Adding ' + '(lsn: ' + str(lsn) + '): \t' + 'record' + str(i) + str(i + 100))
+
+        for l in lm.iterator():
+            temp_page = Page(l)  # We have keep it in memory to parse its content
+            record_str = temp_page.getStr(0)
+            record_int = temp_page.getInt(
+                4 + len(record_str))  # also need to add 4 byte for the recoded length of the string
+            print('Reading:  ' + record_str + str(record_int))
+
+        for i in range(36, 71):
+            lsn = createLogRecord('record' + str(i), i + 100)
+            print('Adding ' + '(lsn: ' + str(lsn) + '): \t' + 'record' + str(i) + str(i + 100))
+
+        for l in lm.iterator():
+            temp_page = Page(l)  # We have keep it in memory to parse its content
+            record_str = temp_page.getStr(0)
+            record_int = temp_page.getInt(
+                4 + len(record_str))  # also need to add 4 byte for the recoded length of the string
+            print('Reading:  ' + record_str + str(record_int))

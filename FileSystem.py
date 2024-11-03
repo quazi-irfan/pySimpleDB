@@ -59,12 +59,10 @@ class Page:
     #   we will need to append a new block; similar to LogMgr.appendLog(b'log_record')
     def setData(self, start, data):
         if isinstance(data, int):
-            data_bin = data.to_bytes(4,
-                                     'big')  # chosing to convert integer to 4 bytes in big endian, which is the same way we write and read numbers
+            data_bin = data.to_bytes(4,'big')  # chosing to convert integer to 4 bytes in big endian, which is the same way we write and read numbers
         elif isinstance(data, str):  # for type str
             data_bin = data.encode('utf-8')
-            data_bin_len = int.to_bytes(len(data_bin), 4,
-                                        'big')  # size in byte is the same as the length of the string because I am hoping the string content will fall into ascii range
+            data_bin_len = int.to_bytes(len(data_bin), 4,'big')  # size in byte is the same as the length of the string because I am hoping the string content will fall into ascii range
             data_bin = data_bin_len + data_bin
         else:  # types i.e. bytes or bytearray
             data_bin_len = int.to_bytes(len(data), 4, 'big')
@@ -80,7 +78,7 @@ class Page:
         return self.bb[start + 4: start + 4 + str_len].decode()
 
     def getInt(self, start):
-        return int.from_bytes(self.bb[start: start + 4], 'big')
+        return int.from_bytes(self.bb[start: start + 4], 'big') # TODO When reading string/bytes length signed=False needs to be set
 
     def getByte(self, start):
         byte_len = self.getInt(start)
