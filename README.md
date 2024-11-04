@@ -9,18 +9,19 @@ This is a python implementation of [SimpleDB](https://cs.bc.edu/~sciore/simpledb
     - Isolation is implemented by Serializing transactions
 - Storage and Buffer Pool
   - Files are treated as raw disk and part of file(blocks) are paged into memory
-  - Buffer pool maintins a fixed number of in-memory blocks(pages) to minimize disk seek
+  - Buffer pool maintains a fixed number of in-memory blocks(pages) to minimize disk seek
+  - Buffers are swapped out using LRU
 - Concurrent Transactions Support
     - Supports multiple user simultaneously using concurrent transactions
     - Serializability of concurrent transactions is enforced using a variant of two phase locking
-    - In this varaient, locks(shared and exclusive) are acquired on demand, and all released at transcation completion
+    - In this variant, locks(shared and exclusive) are acquired on demand, and all released at transaction completion
     - Locks are acquired on blocks
 - Recovery Manager
   - Write ahead log for recovery
-  - Recovery manager peforms undo operation on all uncommited transactions during database startup
+  - Recovery manager performs undo operation on all uncommited transactions during database startup
   - Log files gets very large, but recovery manager only reads until a quiescent checkpoint
 - Log Manager
-  - Each modication to a field generates a log entry capturing the prior value of the field
+  - Each modification to a field generates a log entry capturing the prior value of the field
   - This prior value is used by Recovery manager to undo all uncommited transactions
 - SQL Support
   - 4 bit integer and fixed length string

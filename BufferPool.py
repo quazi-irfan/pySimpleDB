@@ -38,8 +38,7 @@ class LogMgr:
                 self.log_page = Page(self.file_mgr.block_size)  # not present in the book
                 self.log_page.setData(0, self.file_mgr.block_size)  # at the beginning the page is empty
                 boundary = self.log_page.getInt(0)
-                self.file_mgr.writePageToBlock(self.log_block,
-                                               self.log_page)  # writing the newly created block/page immidiately emulates always having the latest block/page in log_block/log_page
+                self.file_mgr.writePageToBlock(self.log_block, self.log_page)  # writing the newly created block/page immidiately emulates always having the latest block/page in log_block/log_page
 
             offset = boundary - bytes_needed
             self.log_page.setData(offset, log_record)  # ACTUAL WRITE
@@ -102,6 +101,7 @@ class Buffer:
         self.lsn = -1
         self.txnum = -1
         self.pin_count = 0
+        self.time_unpinned = None
 
     # TODO when we might call it as setMod(x, 0)
     def setModified(self, txnum,
@@ -134,6 +134,7 @@ class Buffer:
 
     def unpin(self):
         self.pin_count -= 1
+        self.time_unpinned = time.time_ns()
 
 
 # BufferMgr pins Block(which returns a Buffer ref); The Buffer ref is used to unpin the buffer
@@ -188,8 +189,7 @@ class BufferMgr:
             b = self.tryToPin(target_block)
             start = time.time()
             while not b and (time.time() - start) < 10:  # not b part is a escape hatch
-                self._condition.wait(
-                    2.0)  # Release lock + current thread is put to sleep + auto wakes up after 2 sec and try to pin block again
+                self._condition.wait(2.0)  # Release lock + current thread is put to sleep + auto wakes up after 2 sec and try to pin block again
                 b = self.tryToPin(target_block)
             # we tried to pin a few times, and it has been over 10 seconds
             if not b:
@@ -204,7 +204,7 @@ class BufferMgr:
             b = self.chooseUnpinnedBuffer()  # requested block is not already in the buffer pool; so find an unpinned buffer
             if not b:
                 return None  # requested block is neither in buffer pool nor we have any unpinned buffer
-            b.assignToBlock(target_block)  # found an unpinned buffer; replace its page with requested block
+            b.assignToBlock(target_block)  # DISK WRITE (Page 89, final paragraph); found an unpinned buffer; replace its page with requested block
 
         # if block was already in buffer pool with pin_count non-zero; we do not lose pool availability yet because someone else was already using it
         # if block was already in buffer pool with pin_count zero; we still will lose pool availability because we are about to pin the buffer
@@ -224,13 +224,28 @@ class BufferMgr:
     # requested block is not already in the buffer pool; so find an unpinned buffer
     # https://ksiresearch.org/seke/seke22paper/paper141.pdf
     def chooseUnpinnedBuffer(self):
-        for b in self.buffer_pool:
-            if not b.pin_count > 0:  # TODO: pin_count = 0 implies no tx pinned any block to this buffer yet
-                return b
-        return None
+        current_time = time.time_ns()
+        time_delta = -1
+        target_buffer_index = None
+        for i in range(len(self.buffer_pool)):
+            # TODO: Found a buffer that was never used; Could it actually take place?
+            if not self.buffer_pool[i].time_unpinned:
+                return self.buffer_pool[i]
+
+            # TODO: pin_count = 0 implies no tx pinned any block to this buffer yet
+            # Select the buffer index that was least recently used
+            if not self.buffer_pool[i].pin_count > 0 and current_time - self.buffer_pool[i].time_unpinned >= time_delta:
+                target_buffer_index = i
+                time_delta = current_time - self.buffer_pool[i].time_unpinned
+
+        if target_buffer_index is not None:
+            db_logger.info('Replacing buffer at index ' + str(target_buffer_index)) # TODO: How to make db_logger work when BufferPool run with __main__
+            return self.buffer_pool[target_buffer_index]
+        else:
+            return None
 
 if __name__ == '__main__':
-    fig = [4.5, 4.11, 4.12][2]
+    fig = [4.5, 4.11, 4.12, 401][3]
 
     if fig == 4.12:
         # Fig 4.12 Testing Buffer Manager
@@ -293,7 +308,7 @@ if __name__ == '__main__':
             temp_page = Page(temp_bytearray)  # creating page with desired size because
             pos = temp_page.setData(0, s)
             temp_page.setData(pos, i)
-            lsn = lm.appendLog(temp_page.bb)
+            lsn = lm.appendLog(temp_page.bb) # We are only writing to log file in this test
             return lsn
 
 
@@ -318,3 +333,30 @@ if __name__ == '__main__':
             record_int = temp_page.getInt(
                 4 + len(record_str))  # also need to add 4 byte for the recoded length of the string
             print('Reading:  ' + record_str + str(record_int))
+
+    elif fig == 401:
+        # BufferPool LRU test
+        fm = FileMgr('simpledb', 400)
+        lm = LogMgr(fm, 'simpledb.log')
+        bm = BufferMgr(fm, lm, 3)
+
+        # init
+        buff1 = bm.pin(Block('testfile', 1))
+        buff1.unpin()
+        buff1.pin()
+        buff2 = bm.pin(Block('testfile', 2))
+        buff2.unpin()
+        buff2.pin()
+        buff3 = bm.pin(Block('testfile', 3))
+        buff3.unpin()
+        buff3.pin()
+        print([buff.block for buff in bm.buffer_pool])
+
+        # LRU test
+        buff3.unpin() # least recently used when trying to pin block 4
+        buff2.unpin() # least recently used when trying to ping block 5
+        buff4 = bm.pin(Block('testfile', 4)) # will replace least recently used buff3
+        print([buff.block for buff in bm.buffer_pool])
+        buff1.unpin()
+        buff5 = bm.pin(Block('testfile', 5)) # will replace least recently used buff2
+        print([buff.block for buff in bm.buffer_pool])
