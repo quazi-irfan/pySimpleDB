@@ -8,9 +8,9 @@ This is a python implementation of [SimpleDB](https://cs.bc.edu/~sciore/simpledb
     - Consistency is implemented using runtime check in the query planner
     - Isolation is implemented by Serializing transactions
 - Storage and Buffer Pool
-  - Files are treated as raw disk and part of file(blocks) are paged into memory
-  - Buffer pool maintains a fixed number of in-memory blocks(pages) to minimize disk seek
-  - Buffers are swapped out using LRU
+  - Files are treated as raw disk and file blocks are paged into memory
+  - Fixed number of pages are maintained in an in-memory Buffer pool
+  - Buffers are chosen using LRU and is written to disk before being swapped out
 - Concurrent Transactions Support
     - Supports multiple user simultaneously using concurrent transactions
     - Serializability of concurrent transactions is enforced using a variant of two phase locking

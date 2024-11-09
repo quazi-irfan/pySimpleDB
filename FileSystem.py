@@ -1,6 +1,7 @@
 import os
 import threading
 import logging
+import math
 db_logger = logging.getLogger('SimpleDB')
 
 # file system allows accessing raw disk in blocks.
@@ -13,6 +14,7 @@ db_logger = logging.getLogger('SimpleDB')
 # Each table, table index and db log are stored in a single file
 # Postgresql uses 8kB as block size
 
+# Block index start at 0
 class Block:
     def __init__(self, file_name, block_number):
         self.file_name = file_name
@@ -88,6 +90,10 @@ class Page:
 # Purpose of this class is to write a page to a block
 # Read and trigger immediate disk operation( because buffering it set to 0) to ensure data is saved to disk
 class FileMgr:
+    """
+    Any interaction with file system is handled by this class.
+    For example log manager is writing to log file or buffer manager is flushing all buffers pertaining to transaction.
+    """
     # https://stackoverflow.com/questions/1466000/difference-between-modes-a-a-w-w-and-r-in-built-in-open-function
     def __init__(self, db_name, block_size):
         import os
@@ -98,13 +104,13 @@ class FileMgr:
         os.chdir(os.getcwd() + '/' + db_name)
         # TODO: remove any leftover table?
 
+        self._fileHandles = {}
         self.block_size = block_size
         self._lock = threading.Lock()
 
     def readBlockToPage(self, block, page):
         with self._lock:
-            self.length(block.file_name)  # TODO: hack to create an emptyÎ file if none exists; this needs to be replaced with a list of file handle that cache opened file handles
-            f = open(block.file_name, 'rb', buffering=0)  # Does buffering has any effect on reading?
+            f = self.getFileHandle(block.file_name)
             f.seek(self.block_size * block.block_number)
             # Making sure we are only reading the block size of the file
             # We want to minimize the number of blocks we are reading from the disk
@@ -117,47 +123,41 @@ class FileMgr:
                 page.bb = file_content
             else:
                 page.bb = bytearray(self.block_size)
-            f.close()
 
     # if file does not exist we create a new one
     def writePageToBlock(self, block, page):
         with self._lock:
-            self.length(block.file_name) # TODO: hack to create an emptyÎ file if none exists; this needs to be replaced with a list of file handle that cache opened file handles
             db_logger.info('Disk write of ' + str(block))
-            f = open(block.file_name, 'r+b', buffering=0)  # r is used because a prevents seek and w truncates the file
+            f = self.getFileHandle(block.file_name)  # r is used because a prevents seek and w truncates the file
             f.seek(self.block_size * block.block_number)
             f.write(page.bb)
-            f.close()
 
     # Append a new block to the provided (log) file and return the block reference
     def appendEmptyBlock(self, fileName):
         with self._lock:
-            f = open(fileName, 'ab', buffering=0)  # How does append mode behave if file do not exists?
+            f = self.getFileHandle(fileName)
             new_block_number = self.length(fileName)
             f.seek(self.block_size * new_block_number)  # seek doesn't with a mode
             temp_page = Page(self.block_size)
             f.write(temp_page.bb)
-            f.close()
         return Block(fileName, new_block_number)
 
     def length(self, file_name):
         """return the length of file in terms of block. Access through transaction to ensure thread safety."""
-        try:
-            return os.path.getsize(file_name) // self.block_size
-        except:
-            # trying to get number of block in a file that doesn't exist
-            # context manager cleanup resources
-            with open(file_name, 'wb', buffering=0):
-                pass
-            return 0  # New file don't have any block in it
+        f = self.getFileHandle(file_name)
+        return math.ceil(f.seek(0, os.SEEK_END) / self.block_size)
+
+    def getFileHandle(self, file_name):
+        if file_name not in self._fileHandles:
+            open(file_name, 'wb', buffering=0).close()
+            self._fileHandles[file_name] = open(file_name, 'r+b', buffering=0) # Allow 0 byte to buffer
+        return self._fileHandles[file_name]
 
 # 3.12 Testing file manager
 # File for each table; many blocks(identified by id) for each file
 # these files needs to be created inside a folded named $db
 if __name__ == '__main__':
     fm = FileMgr('filetest', 400)  # Kernel page size; usually 4096 bytes
-    from BufferPool import LogMgr
-    lm = LogMgr(fm, 'simpledb.log')
     b1 = Block('testfile', 2)
     p1 = Page(fm.block_size)
     pos = 88  # position relative to the current block, so should always be between 0 <= block_size < 400

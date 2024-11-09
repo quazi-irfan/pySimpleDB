@@ -1,32 +1,52 @@
 from FileSystem import *
 import time
 import logging
+from typing import List
 db_logger = logging.getLogger('SimpleDB')
 
+# Writing log page can happen in following instances
+#   Appending new log to page, but the current page is full
+#   Commiting transaction trigger two separate log flush
+#       flushing associated buffer trigger flushing associated logs first
+#       After buffers associated a transaction is flushed, final transaction commit log is also flushed to disk
 class LogMgr:
+    """
+    DB uses a single instance of log manger to write to the log file. Log manager does three things,
+
+    - appends blocks to log file,
+    - maintains a page which is a copy of the final block,
+    - appends log records(byte array) to the log page, and
+    - provides and iterator to go over the log file from most recent to the least recent records
+    """
     # Needs access to file manager because if no log file is present we make one with given block size
     def __init__(self, file_mgr, log_file):
-        self.file_mgr = file_mgr
-        self.log_file = log_file
-        self.current_lsn = 0
-        self.last_saved_lsn = 0  # last_flushed_lsn
-
-        self.log_page = Page(self.file_mgr.block_size)
-        log_block_count = self.file_mgr.length(self.log_file)
         self._lock = threading.Lock()
 
-        if log_block_count:
-            # read last block of log file and put it in a page
-            self.log_block = Block(self.log_file, log_block_count - 1)
-            self.file_mgr.readBlockToPage(self.log_block, self.log_page)
-        else:
-            # create new log, block and page
+        self.file_mgr: FileMgr = file_mgr
+        self.log_file = log_file
+
+        self.current_lsn = 0 # Start at 0, but gets set to 1 after adding the first record
+        self.last_saved_lsn = 0  # last_flushed_lsn
+
+        # LogMgr caches the last block from the log file to minimize disk seek
+        self.log_page = Page(self.file_mgr.block_size)
+        log_block_count = self.file_mgr.length(self.log_file)
+
+        if log_block_count == 0:
+            # Log file is empty with zero blocks
             self.log_block = self.file_mgr.appendEmptyBlock(self.log_file)
             self.log_page.setData(0, self.file_mgr.block_size)
             self.file_mgr.writePageToBlock(self.log_block, self.log_page)
+        else:
+            # Log file is not empty; therefore read the last block to a page
+            self.log_block = Block(self.log_file, log_block_count - 1)
+            self.file_mgr.readBlockToPage(self.log_block, self.log_page)
+
 
     # add b'log_record' to current log_page and return current_lsn
+    # Only constrain is log_record must fit inside a single log page
     def appendLog(self, log_record):
+        """Append log record to current log page. If log record does not fit in the current page, append a new block."""
         with self._lock:
             boundary = self.log_page.getInt(0)
             bytes_needed = len(log_record) + 4  # for writing length of binary blob
@@ -34,34 +54,37 @@ class LogMgr:
             # check if there is room for the new log record on the current page
             if boundary - bytes_needed < 4:  # first 4 bytes are reserved
                 self.flushPage()
-                self.log_block = self.file_mgr.appendEmptyBlock(self.log_file)  # appendNewBlock()
+                self.log_block = self.file_mgr.appendEmptyBlock(self.log_file)  # appendNewBlock() function in the book
                 self.log_page = Page(self.file_mgr.block_size)  # not present in the book
                 self.log_page.setData(0, self.file_mgr.block_size)  # at the beginning the page is empty
                 boundary = self.log_page.getInt(0)
                 self.file_mgr.writePageToBlock(self.log_block, self.log_page)  # writing the newly created block/page immidiately emulates always having the latest block/page in log_block/log_page
 
             offset = boundary - bytes_needed
-            self.log_page.setData(offset, log_record)  # ACTUAL WRITE
+            self.log_page.setData(offset, log_record)
             self.log_page.setData(0, offset)  # Update offset for the next write
             self.current_lsn += 1
             return self.current_lsn
 
     # Log manager manually decides when to write the page to disk
-    def flushPage(self, lsn=None):
-        # without lsn; flush the log page
-        if not lsn:
+    # flushPage takes optional log serial number to determine if there is any new log to warrant a disk write
+    def flushPage(self, at_lsn=None):
+        """Flush all record until at_lsn"""
+        # flush log page
+        if at_lsn is None:
             self.file_mgr.writePageToBlock(self.log_block, self.log_page)
             self.last_saved_lsn = self.current_lsn  # because we will be flushing all logs from the single log page
             return
 
-        # with lsn; dont flush the log page if those lsn were already flushed
-        if lsn > self.last_saved_lsn:  # TODO: do we need >= instead?
+        # flush log page only if there are un-flushed log records
+        if self.last_saved_lsn < at_lsn:
             self.flushPage()
 
     # this is a stateful function; depends on what block log manager is currently working on
     def iterator(self):
+        """Get an iterator that is pointing to the last block"""
         self.flushPage()  # we flush the log page to ensure iteration goes over all log records
-        return LogIter(self.file_mgr, self.log_block)  # Returning the current block
+        return LogIter(self.file_mgr, self.log_block)  # Start at the current block and read backward until the first block
 
 
 class LogIter:
@@ -75,10 +98,11 @@ class LogIter:
         self.current_offset = self.temp_page.getInt(0)
         return self  # returning self because in each loop self.__next__ will be called
 
+    # log records are read in reverse order in which they were written
+    # when there are no more records, move to the next block
     def __next__(self):
         if self.current_offset >= self.fm.block_size:  # reached at the end of the block
-            self.block = Block(self.block.file_name,
-                               self.block.block_number - 1)  # TODO: Why -1? Doesn't block number start
+            self.block = Block(self.block.file_name, self.block.block_number - 1)  # TODO: Why -1? Doesn't block number start
             if self.block.block_number < 0:
                 raise StopIteration()
             else:
@@ -93,8 +117,8 @@ class LogIter:
 # pins page to block and tracks pin count
 class Buffer:
     def __init__(self, fm, lm):
-        self.fm = fm
-        self.lm = lm
+        self.fm: FileMgr = fm
+        self.lm: LogMgr = lm
 
         self.block = None
         self.page = Page(fm.block_size)
@@ -104,8 +128,7 @@ class Buffer:
         self.time_unpinned = None
 
     # TODO when we might call it as setMod(x, 0)
-    def setModified(self, txnum,
-                    lsn):  # once Transaction sets data, it updates the txnum that updated the buffer, and pos lsn if it was loggable activity
+    def setModified(self, txnum, lsn):  # once Transaction sets data, it updates the txnum that updated the buffer, and pos lsn if it was loggable activity
         self.txnum = txnum
         if lsn >= 0:  # first lsn value is 1
             self.lsn = lsn
@@ -156,16 +179,18 @@ class BufferMgr:
     # lm gets passed to Buffer class to flush dirty log block
     # fm gets passed to Buffer class to write buffer to page
     def __init__(self, fm, lm, num_buffers):
+        self._condition = threading.Condition()  # Condition is event and lock combined
+
         self.fm = fm
         self.lm = lm
         self.num_buffers = num_buffers
 
         # Here are are initiating buffer, but it doesn't do much since the block and page information are filled out later bm is pinning
-        self.buffer_pool = [Buffer(self.fm, self.lm) for _ in range(self.num_buffers)]
+        self.buffer_pool: List[Buffer] = [Buffer(self.fm, self.lm) for _ in range(self.num_buffers)]
         self.pool_availability = self.num_buffers
-        self._condition = threading.Condition()  # Condition is event and lock combined
 
     def flushAll(self, at_txnum):
+        """Flush all pages modified by at a transaction"""
         with self._condition:
             for b in self.buffer_pool:
                 if b.txnum == at_txnum:
@@ -245,7 +270,7 @@ class BufferMgr:
             return None
 
 if __name__ == '__main__':
-    fig = [4.5, 4.11, 4.12, 401][3]
+    fig = [4.5, 4.11, 4.12, 401][0]
 
     if fig == 4.12:
         # Fig 4.12 Testing Buffer Manager
