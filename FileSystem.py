@@ -16,6 +16,11 @@ db_logger = logging.getLogger('SimpleDB')
 
 # Block index start at 0
 class Block:
+    """
+    Block represents raw block of a file.
+
+    It contains file name and block number.
+    """
     def __init__(self, file_name, block_number):
         self.file_name = file_name
         self.block_number = block_number
@@ -32,7 +37,7 @@ class Block:
 
     # When printed directly
     def __str__(self):
-        return "[file name: " + self.file_name + ", block num: " + str(self.block_number) + "]"
+        return "[file: " + self.file_name + ", block: " + str(self.block_number) + "]"
 
     # def __str__(self):
     #     return "[file name: " + self.file_name + ", block num: " + str(self.block_number) + "]"
@@ -47,6 +52,12 @@ class Block:
 # f = open('all_tables', 'wb', buffering=0)
 # f.write(page) # will trigger system write as there is no buffering
 class Page:
+    """
+    Page is in-memory blocks. Blocks are read as a byte array into pages.
+
+    This class provides convenience function to read and write to the byte array.
+    """
+    # Page(int) trigger allocation of bytearray(length) in memory
     def __init__(self, data):
         # get either size to create an empty page, or data that needs to put in a page
         # bytearray(data) allocates new one in memory - usage is heavily controlled by Buffer manager
@@ -66,7 +77,7 @@ class Page:
             data_bin = data.encode('utf-8')
             data_bin_len = int.to_bytes(len(data_bin), 4,'big')  # size in byte is the same as the length of the string because I am hoping the string content will fall into ascii range
             data_bin = data_bin_len + data_bin
-        else:  # types i.e. bytes or bytearray
+        else:  # TODO: Is else always expecting bytearray?
             data_bin_len = int.to_bytes(len(data), 4, 'big')
             data_bin = data_bin_len + data
 
@@ -92,7 +103,8 @@ class Page:
 class FileMgr:
     """
     Any interaction with file system is handled by this class.
-    For example log manager is writing to log file or buffer manager is flushing all buffers pertaining to transaction.
+    Interaction includes reading/writing file block into page. It also includes getting the number of blocks in a file and appending if needed.
+    For example when log manager is writing to log file or buffer manager is flushing all buffers of a transaction.
     """
     # https://stackoverflow.com/questions/1466000/difference-between-modes-a-a-w-w-and-r-in-built-in-open-function
     def __init__(self, db_name, block_size):

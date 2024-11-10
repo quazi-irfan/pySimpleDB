@@ -13,10 +13,10 @@ class LogMgr:
     """
     DB uses a single instance of log manger to write to the log file. Log manager does three things,
 
-    - appends blocks to log file,
-    - maintains a page which is a copy of the final block,
+    - appends blocks to log file if there is not enough blocks to write
+    - maintains a page which is a copy of the last block of the log file,
     - appends log records(byte array) to the log page, and
-    - provides and iterator to go over the log file from most recent to the least recent records
+    - provides an iterator to go over the log file from most recent to the least recent records
     """
     # Needs access to file manager because if no log file is present we make one with given block size
     def __init__(self, file_mgr, log_file):
@@ -116,24 +116,41 @@ class LogIter:
 
 # pins page to block and tracks pin count
 class Buffer:
+    """
+    Every buffer has some associated information,
+     - Which transaction modified it and the associated log serial number.
+     - How many transaction are currently pinning a buffer
+     - When the buffer was unpinned
+
+    assignToBlock use by buffer manager's pin method
+
+    flushDirtyBufferWithLog use by both buffer(when new blog is beign assigned) and buffer manager(when all buffers are being flushed)
+
+    setModified use by transaction when log entry is generated during updating the buffer
+    """
     def __init__(self, fm, lm):
         self.fm: FileMgr = fm
         self.lm: LogMgr = lm
 
         self.block = None
         self.page = Page(fm.block_size)
+
         self.lsn = -1
         self.txnum = -1
         self.pin_count = 0
-        self.time_unpinned = None
+        self.time_pinned = time.time_ns()
 
     # TODO when we might call it as setMod(x, 0)
     def setModified(self, txnum, lsn):  # once Transaction sets data, it updates the txnum that updated the buffer, and pos lsn if it was loggable activity
+        """Used by Transaction class """
         self.txnum = txnum
-        if lsn >= 0:  # first lsn value is 1
+        # Sometimes modification to buffer is not logged, i.e. when formatting a new block
+        # In that case transaction call this method with lsn set to -1
+        if lsn >= 0:
             self.lsn = lsn
 
     def assignToBlock(self, block):
+        """Used internally when buffer manager pins a block"""
         self.flushDirtyBufferWithLog()
         self.block = block
         self.fm.readBlockToPage(block, self.page)  # save the requested block to the Buffer's page
@@ -142,6 +159,13 @@ class Buffer:
         self.pin_count = 0
 
     def flushDirtyBufferWithLog(self):
+        """
+        Flush buffer only if it was modified by a transaction
+
+        We flush the log before we flush the buffer.
+        Since our log is append only, this setup works as a WAL - write ahead log.
+        In the event we fail to flush the buffer WAL can be used to reconstruct the buffer.
+        """
         if self.txnum >= 0:
             # write ahead log; anytime we are about to flush a buffer; FLUSH THE LOG FIRST
             # This ensures Page 116, (b) doesn't happen when buffer on disk has the data but log do not
@@ -157,8 +181,9 @@ class Buffer:
 
     def unpin(self):
         self.pin_count -= 1
-        self.time_unpinned = time.time_ns()
 
+    def __repr__(self):
+        return f"[Block: ({str(self.block.file_name)},{str(self.block.block_number)}), lsn: {str(self.lsn)}, txnum: {str(self.txnum)}, pin_count: {str(self.pin_count)},time_pinned: {str(self.time_pinned)}]"
 
 # BufferMgr pins Block(which returns a Buffer ref); The Buffer ref is used to unpin the buffer
 # BufferMgr does two things.
@@ -176,8 +201,21 @@ class Buffer:
 #   - all buffer is the buffer pool is pinned
 #   - at least one buffer is the buffer pool is not pinned
 class BufferMgr:
+    """
+    Buffer Manager maintains a pool of buffers.
+    buffer_ref = bm.pin(Block())
+    buffer_ref.pin()
+    bm.unpin(buffer_ref)
+
+    Buffers flush can happen in two occasion,
+     - Different block will get pinned
+     - Recovery manager needs to flush the block during transaction commit
+    """
     # lm gets passed to Buffer class to flush dirty log block
     # fm gets passed to Buffer class to write buffer to page
+
+    WAIT_TIME = 10
+
     def __init__(self, fm, lm, num_buffers):
         self._condition = threading.Condition()  # Condition is event and lock combined
 
@@ -190,14 +228,14 @@ class BufferMgr:
         self.pool_availability = self.num_buffers
 
     def flushAll(self, at_txnum):
-        """Flush all pages modified by at a transaction"""
+        """Flush all pages modified by a given transaction"""
         with self._condition:
             for b in self.buffer_pool:
                 if b.txnum == at_txnum:
                     b.flushDirtyBufferWithLog()
 
     # takes buffer; returns nothing
-    def unpin(self, target_buffer):
+    def unpin(self, target_buffer: Buffer):
         db_logger.info('Unpinning ' + str(target_buffer.block))
         with self._condition:
             target_buffer.unpin()
@@ -213,12 +251,17 @@ class BufferMgr:
         with self._condition:
             b = self.tryToPin(target_block)
             start = time.time()
-            while not b and (time.time() - start) < 10:  # not b part is a escape hatch
-                self._condition.wait(2.0)  # Release lock + current thread is put to sleep + auto wakes up after 2 sec and try to pin block again
-                b = self.tryToPin(target_block)
+            while not b and (time.time() - start) < BufferMgr.WAIT_TIME:  # not b part is a escape hatch
+                # Release lock + current thread is put to sleep.
+                # This thread auto wake up after 2 sec and try to pin block again
+                # This thread also wake up notify_all() is called
+                self._condition.wait(2.0)
+                b = self.tryToPin(target_block) # This line is hit once every 2 second or when notify_all() is called
             # we tried to pin a few times, and it has been over 10 seconds
+            # this can be None because multiple threads are racing to get a buffer
             if not b:
-                raise Exception("Buffer Pool is full.")
+                # More in Ch 14 Buffer Utilization
+                raise Exception("Failed to allocate buffer. Either buffer pool is full or a deadlock was detected. Aborted transaction should be rolled back.")
         db_logger.info('Pinned ' + str(target_block))
         return b
 
@@ -231,9 +274,10 @@ class BufferMgr:
                 return None  # requested block is neither in buffer pool nor we have any unpinned buffer
             b.assignToBlock(target_block)  # DISK WRITE (Page 89, final paragraph); found an unpinned buffer; replace its page with requested block
 
-        # if block was already in buffer pool with pin_count non-zero; we do not lose pool availability yet because someone else was already using it
-        # if block was already in buffer pool with pin_count zero; we still will lose pool availability because we are about to pin the buffer
-        if not b.pin_count > 0:
+        # if block was already in buffer pool with pin_count,
+        #   non-zero; we do not lose pool availability yet because someone else was already using it
+        #   zero; we still will lose pool availability because we are about to pin the buffer
+        if b.pin_count == 0:
             self.pool_availability -= 1
 
         b.pin()
@@ -254,14 +298,14 @@ class BufferMgr:
         target_buffer_index = None
         for i in range(len(self.buffer_pool)):
             # TODO: Found a buffer that was never used; Could it actually take place?
-            if not self.buffer_pool[i].time_unpinned:
-                return self.buffer_pool[i]
+            # if not self.buffer_pool[i].time_unpinned:
+            #     return self.buffer_pool[i]
 
             # TODO: pin_count = 0 implies no tx pinned any block to this buffer yet
             # Select the buffer index that was least recently used
-            if not self.buffer_pool[i].pin_count > 0 and current_time - self.buffer_pool[i].time_unpinned >= time_delta:
+            if self.buffer_pool[i].pin_count == 0 and current_time - self.buffer_pool[i].time_pinned >= time_delta:
                 target_buffer_index = i
-                time_delta = current_time - self.buffer_pool[i].time_unpinned
+                time_delta = current_time - self.buffer_pool[i].time_pinned
 
         if target_buffer_index is not None:
             db_logger.info('Replacing buffer at index ' + str(target_buffer_index)) # TODO: How to make db_logger work when BufferPool run with __main__
@@ -270,14 +314,14 @@ class BufferMgr:
             return None
 
 if __name__ == '__main__':
-    fig = [4.5, 4.11, 4.12, 401][0]
+    fig = [4.5, 4.11, 4.12, 401][3]
 
     if fig == 4.12:
         # Fig 4.12 Testing Buffer Manager
         fm: FileMgr = FileMgr('simpledb', 400)
         lm: LogMgr = LogMgr(fm, 'simpledb.log')
         bm: BufferMgr = BufferMgr(fm, lm, 3)
-        buff = []  # we will append six BLock references in this list
+        buff = []
         buff.append(bm.pin(Block('testfile', 0)))
         buff.append(bm.pin(Block('testfile', 1)))
         buff.append(bm.pin(Block('testfile', 2)))
@@ -288,12 +332,12 @@ if __name__ == '__main__':
         print('Available buffer count: ' + str(bm.pool_availability))
         try:
             print("Attempting to pin block 3...")
-            buff.append(bm.pin(Block('testfile', 3)))
+            buff.append(bm.pin(Block('testfile', 3))) # Fail pin
         except Exception as e:
             print("Exception: " + str(e))
         bm.unpin(buff[2])  # unpin testfile, 2
         buff[2] = None
-        buff.append(bm.pin(Block('testfile', 3)))  # pin testfile, 3
+        buff.append(bm.pin(Block('testfile', 3)))  # Success pin testfile, 3
 
         print("Final buffer allocation.")
         for i in range(len(buff)):
@@ -306,13 +350,14 @@ if __name__ == '__main__':
         lm = LogMgr(fm, 'simpledb.log')
         bm = BufferMgr(fm, lm, 3)
         buff1 = bm.pin(Block('testfile', 1))
-        n = buff1.page.getInt(80)  # it should return empty because testfile is of size zero
+        n = buff1.page.getInt(80)  # returns 0
         buff1.page.setData(80, n + 1)
-        buff1.setModified(1, 0)  # does lsn start at zero?
+        buff1.setModified(1, 0)  # transaction 1, lsn 0; we do this otherwise buffer can't be flushed without tx number (flushDirtyBufferWithLog)
         print('The new value is ', n + 1)
         bm.unpin(buff1)  # we do not immediately write it back to disk because some other client might pin it again
 
-        buff2 = bm.pin(Block('testfile', 2))  # this write the block 1 back to disk
+        # Pulling in three blocks will evict buff1 since size of buffer pool is 3
+        buff2 = bm.pin(Block('testfile', 2))
         buff3 = bm.pin(Block('testfile', 3))
         buff4 = bm.pin(Block('testfile', 4))
 
@@ -320,8 +365,7 @@ if __name__ == '__main__':
         buff11 = bm.pin(Block('testfile', 1))
         buff11.page.setData(80, 9999)
         buff11.setModified(1, 0)
-        buff11.unpin()  # This modification won't get written to disk because there is noting forcing it
-        bm.flushAll(2)
+        buff11.unpin()  # This modification won't get written to disk because there is nothing forcing buffer manager to do so
 
     elif fig == 4.5:
         # Fig 4.5 Testing Log Manager
@@ -365,23 +409,14 @@ if __name__ == '__main__':
         lm = LogMgr(fm, 'simpledb.log')
         bm = BufferMgr(fm, lm, 3)
 
-        # init
         buff1 = bm.pin(Block('testfile', 1))
-        buff1.unpin()
-        buff1.pin()
         buff2 = bm.pin(Block('testfile', 2))
-        buff2.unpin()
-        buff2.pin()
         buff3 = bm.pin(Block('testfile', 3))
+        print(*[buff for buff in bm.buffer_pool], sep='\n')
         buff3.unpin()
-        buff3.pin()
-        print([buff.block for buff in bm.buffer_pool])
-
-        # LRU test
-        buff3.unpin() # least recently used when trying to pin block 4
-        buff2.unpin() # least recently used when trying to ping block 5
+        buff2.unpin()
         buff4 = bm.pin(Block('testfile', 4)) # will replace least recently used buff3
-        print([buff.block for buff in bm.buffer_pool])
+        print(*[buff for buff in bm.buffer_pool], sep='\n')
         buff1.unpin()
         buff5 = bm.pin(Block('testfile', 5)) # will replace least recently used buff2
-        print([buff.block for buff in bm.buffer_pool])
+        print(*[buff for buff in bm.buffer_pool], sep='\n')

@@ -10,7 +10,7 @@ This is a python implementation of [SimpleDB](https://cs.bc.edu/~sciore/simpledb
 - Storage and Buffer Pool
   - Files are treated as raw disk and file blocks are paged into memory
   - Fixed number of pages are maintained in an in-memory Buffer pool
-  - Buffers are chosen using LRU and is written to disk before being swapped out
+  - Buffers are swap out using FIFO
 - Concurrent Transactions Support
     - Supports multiple user simultaneously using concurrent transactions
     - Serializability of concurrent transactions is enforced using a variant of two phase locking
