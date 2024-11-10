@@ -23,7 +23,7 @@ class Block:
     """
     def __init__(self, file_name, block_number):
         self.file_name = file_name
-        self.block_number = block_number
+        self.block_number = block_number # Block number -1 is a special marker block to prevent conflicting file modification by concurrent transactions
 
     def __eq__(self, other):
         return self.file_name == other.file_name and self.block_number == other.block_number

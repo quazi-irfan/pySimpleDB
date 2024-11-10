@@ -475,6 +475,9 @@ class BufferList:
 
 # Normal db shutdown involves completing all transactions and flushing buffers into disk
 class Transaction:
+    """
+    Transaction is a series of operations that behaves as a single operation
+    """
     # Used together to synchronously increase txnum
     _lock = threading.Lock()
     _next_txnum = 0
@@ -578,3 +581,175 @@ class Transaction:
         with Transaction._lock:
             Transaction._next_txnum += 1
         return Transaction._next_txnum
+
+
+if __name__ == "__main__":
+    fig = [5.3, 5.19, 501][2]
+
+    if fig == 501:
+        # RecoveryTest - Not mentioned the book
+        fm: FileMgr = FileMgr('simpledb', 400)
+        lm: LogMgr = LogMgr(fm, 'simpledb.log')
+        bm: BufferMgr = BufferMgr(fm, lm, 2)
+
+        if fm.length('testfile'):
+            # recover
+            tx = Transaction(fm, lm, bm)
+            tx.recover()
+            print('recovery - complete')
+        else:
+            # init
+            tx1 = Transaction(fm, lm, bm)
+            tx2 = Transaction(fm, lm, bm)
+            blk0 = Block('testfile', 0)
+            blk1 = Block('testfile', 1)
+            tx1.pin(blk0)
+            tx2.pin(blk1)
+            pos = 0
+            for i in range(6):
+                tx1.setInt(blk0, pos, pos, False)
+                tx2.setInt(blk1, pos, pos, False)
+                pos += 4
+            tx1.setString(blk0, 30, "abc", False)
+            tx2.setString(blk1, 30, "def", False)
+            tx1.commit()
+            tx2.commit()
+
+            # modify
+            tx3 = Transaction(fm, lm, bm)
+            tx4 = Transaction(fm, lm, bm)
+            tx3.pin(blk0)
+            tx4.pin(blk1)
+            pos = 0
+            for i in range(6):
+                tx3.setInt(blk0, pos, pos + 100, True)
+                tx4.setInt(blk1, pos, pos + 100, True)
+                pos += 4
+            tx3.setString(blk0, 30, 'uvw', True)
+            tx4.setString(blk1, 30, 'xyz', True)
+            # tx3.commit()
+            # tx4.commit()
+            bm.flushAll(3)
+            bm.flushAll(4)
+
+            tx3.rollback()
+
+            print('init and modify - complete')
+            for l in lm.iterator():
+                print(LogRecord.toString(l))
+
+    elif fig == 5.19:
+        # Fig 5.19 ConcurrencyTest; Testing Concurrency class
+        fm = FileMgr('simpledb', 400)
+        lm = LogMgr(fm, 'simpledb.log')
+        bm = BufferMgr(fm, lm, 8)
+
+        def A():
+            try:
+                txA = Transaction(fm, lm, bm)
+                blk1 = Block('testfile', 1)
+                blk2 = Block('testfile', 2)
+                txA.pin(blk1)
+                txA.pin(blk2)
+                print('txA requesting slock1')
+                txA.getInt(blk1, 0)
+                print('txA received slock1')
+                time.sleep(1)
+                print('txA requesting slock2')
+                txA.getInt(blk2, 0)
+                print('txA received slock2')
+                txA.commit()
+            except Exception as e:
+                txA.rollback()
+                print("Exception: " + str(e))
+
+        def B():
+            try:
+                txB = Transaction(fm, lm, bm)
+                blk1 = Block('testfile', 1)
+                blk2 = Block('testfile', 2)
+                txB.pin(blk1)
+                txB.pin(blk2)
+                print('txB requesting xlock2')
+                txB.setInt(blk2, 0, 0, False)
+                print('txB received xlock2')
+                time.sleep(1)
+                print('txB requesting slock1')
+                txB.getInt(blk1, 0)
+                print('txB received slock1')
+                txB.commit()
+            except Exception as e:
+                txB.rollback()
+                print("Exception: " + str(e))
+
+        def C():
+            try:
+                txC = Transaction(fm, lm, bm)
+                blk1 = Block('testfile', 1)
+                blk2 = Block('testfile', 2)
+                txC.pin(blk1)
+                txC.pin(blk2)
+                print('txC requesting xlock1')
+                txC.setInt(blk1, 0, 0, False)
+                print('txC received xlock1')
+                time.sleep(1)
+                print('txC requesting slock2')
+                txC.getInt(blk2, 0)
+                print('txC received slock2')
+                txC.commit()
+            except Exception as e:
+                txC.rollback()
+                print("Exception: " + str(e))
+
+
+        t1 = threading.Thread(target=A)
+        t1.start()
+        t2 = threading.Thread(target=B)
+        t2.start()
+        t3 = threading.Thread(target=C)
+        t3.start()
+
+        t1.join()
+        t2.join()
+        t3.join()
+
+        for l in lm.iterator():
+            print(LogRecord.toString(l))
+
+    elif fig == 5.3:
+        # Fig 5.3 TxTest; Testing Transactions
+        fm = FileMgr('simpledb', 400)
+        lm = LogMgr(fm, 'simpledb.log')
+        bm = BufferMgr(fm, lm, 8)
+
+        tx1 = Transaction(fm, lm, bm)
+        blk = Block('testfile', 1)
+        tx1.pin(blk)
+        tx1.setInt(blk, 80, 1, False)
+        tx1.setString(blk, 40, "one", False)
+        tx1.commit()
+
+        tx2 = Transaction(fm, lm, bm)
+        tx2.pin(blk)
+        ival = tx2.getInt(blk, 80)
+        sval = tx2.getString(blk, 40)
+        print("Initial value at loc 80 =", str(ival))
+        print("Initial value at loc 40 =", str(sval))
+        newival = ival + 1
+        newsval = sval + '!'
+        tx2.setInt(blk, 80, newival, True)
+        tx2.setString(blk, 40, newsval, True)
+        tx2.commit()
+
+        tx3 = Transaction(fm, lm, bm)
+        tx3.pin(blk)
+        print('new value at loc 80 = ', str(tx3.getInt(blk, 80)))
+        print('new value at loc 40 = ', str(tx3.getString(blk, 40)))
+        tx3.setInt(blk, 80, 9999, True)
+        print('pre-rollback value at loc 80 = ', str(tx3.getInt(blk, 80)))
+        tx3.rollback()
+
+        tx4 = Transaction(fm, lm, bm)
+        tx4.pin(blk)
+        print('post-rollback value at loc 80 = ', str(tx4.getInt(blk, 80)))
+        tx4.commit()
