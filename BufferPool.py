@@ -135,7 +135,7 @@ class Buffer:
         self.block = None
         self.page = Page(fm.block_size)
 
-        self.lsn = -1
+        self.lsn = -1 # TODO: I think this should be part of buffer pool class because this value do not get reset once new buffer is pinned
         self.txnum = -1
         self.pin_count = 0
         self.time_pinned = time.time_ns()
@@ -157,6 +157,7 @@ class Buffer:
         # why we are not incrementing pin count anytime we are reading a block;
         # because, pin count zero could also mean all clients that was using this buffer no longer need it anymore
         self.pin_count = 0
+        self.time_pinned = time.time_ns()
 
     def flushDirtyBufferWithLog(self):
         """
@@ -261,7 +262,7 @@ class BufferMgr:
             # this can be None because multiple threads are racing to get a buffer
             if not b:
                 # More in Ch 14 Buffer Utilization
-                raise Exception("Failed to allocate buffer. Either buffer pool is full or a deadlock was detected. Aborted transaction should be rolled back.")
+                raise Exception("Buffer pinning failed because buffer pool is full. Aborted transaction should be rolled back.")
         db_logger.info('Pinned ' + str(target_block))
         return b
 
@@ -412,11 +413,11 @@ if __name__ == '__main__':
         buff1 = bm.pin(Block('testfile', 1))
         buff2 = bm.pin(Block('testfile', 2))
         buff3 = bm.pin(Block('testfile', 3))
-        print(*[buff for buff in bm.buffer_pool], sep='\n')
+        print([buff for buff in bm.buffer_pool])
         buff3.unpin()
         buff2.unpin()
         buff4 = bm.pin(Block('testfile', 4)) # will replace least recently used buff3
-        print(*[buff for buff in bm.buffer_pool], sep='\n')
+        print([buff for buff in bm.buffer_pool])
         buff1.unpin()
         buff5 = bm.pin(Block('testfile', 5)) # will replace least recently used buff2
-        print(*[buff for buff in bm.buffer_pool], sep='\n')
+        print([buff for buff in bm.buffer_pool])
