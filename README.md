@@ -16,8 +16,9 @@ This is a python implementation of [SimpleDB](https://cs.bc.edu/~sciore/simpledb
     - Serializability of concurrent transactions is enforced using a variant of two phase locking
     - In this variant, locks(shared and exclusive) are acquired on demand, and all released at transaction completion
     - Locks are acquired on blocks
-- Recovery Manager
-  - Write ahead log for recovery
+- Logging and Recovery Manager
+  - Logging and recovery is done at field level granularity
+  - Write ahead log is flushed before flushing the buffer to the disk
   - Recovery manager performs undo operation on all uncommited transactions during database startup
   - Log files gets very large, but recovery manager only reads until a quiescent checkpoint
 - Log Manager

@@ -86,6 +86,12 @@ class LogMgr:
         self.flushPage()  # we flush the log page to ensure iteration goes over all log records
         return LogIter(self.file_mgr, self.log_block)  # Start at the current block and read backward until the first block
 
+    def __repr__(self):
+        import Transaction # Read more about cyclic dependency https://stackoverflow.com/a/11698542/689991
+        all_logs = ''
+        for l in self.iterator():
+            all_logs = all_logs + Transaction.LogRecord.toString(l) + '\n'
+        return all_logs
 
 class LogIter:
     def __init__(self, fm, block):
@@ -102,7 +108,7 @@ class LogIter:
     # when there are no more records, move to the next block
     def __next__(self):
         if self.current_offset >= self.fm.block_size:  # reached at the end of the block
-            self.block = Block(self.block.file_name, self.block.block_number - 1)  # TODO: Why -1? Doesn't block number start
+            self.block = Block(self.block.file_name, self.block.block_number - 1)
             if self.block.block_number < 0:
                 raise StopIteration()
             else:
@@ -127,6 +133,8 @@ class Buffer:
     flushDirtyBufferWithLog use by both buffer(when new blog is beign assigned) and buffer manager(when all buffers are being flushed)
 
     setModified use by transaction when log entry is generated during updating the buffer
+
+    TODO: Add set/get method that will in-turns call page's set/get method; this will help timestamping each update
     """
     def __init__(self, fm, lm):
         self.fm: FileMgr = fm
@@ -142,7 +150,15 @@ class Buffer:
 
     # TODO when we might call it as setMod(x, 0)
     def setModified(self, txnum, lsn):  # once Transaction sets data, it updates the txnum that updated the buffer, and pos lsn if it was loggable activity
-        """Used by Transaction class """
+        """
+        This method is used by the transaction class to update the txnum and lsn that updated the buffer.
+
+        We always record which tx updated the buffer.
+        But we do not always update the lsn, and this function is called with lsn set to -1.
+        There are two situation where we do not want to update lsn of a buffer.
+        - when Formatting buffer
+        - during recovery when we are undo changes
+        """
         self.txnum = txnum
         # Sometimes modification to buffer is not logged, i.e. when formatting a new block
         # In that case transaction call this method with lsn set to -1
@@ -150,7 +166,13 @@ class Buffer:
             self.lsn = lsn
 
     def assignToBlock(self, block):
-        """Used internally when buffer manager pins a block"""
+        """
+        We only flush buffer and its associated log during buffer swap and transaction commit.
+        This is a tradeoff for problem explained in 5.3.5 paragraph 2
+        During system crash, we may lose both
+        - buffer and log OR (situation d in Page 116)
+        - just buffer (i.e. log was flushed because it was full) (Situation c in Page 116)
+        """
         self.flushDirtyBufferWithLog()
         self.block = block
         self.fm.readBlockToPage(block, self.page)  # save the requested block to the Buffer's page
@@ -161,13 +183,16 @@ class Buffer:
 
     def flushDirtyBufferWithLog(self):
         """
-        Flush buffer only if it was modified by a transaction
+        Flush buffer only if it was modified by a transaction.
 
         We flush the log before we flush the buffer.
+        By flushing logs before flushing buffer we ensure that at least logs must be on disk even if buffer may not. (This fixed situation b in page 116).
+        (If we fail to flush log then all is lost.)
         Since our log is append only, this setup works as a WAL - write ahead log.
-        In the event we fail to flush the buffer WAL can be used to reconstruct the buffer.
+        In the event we fail to flush the buffer, these WAL can be used to reconstruct the buffer.
         """
         if self.txnum >= 0:
+            # (Page 113 paragraph 1) Here we are flushing logs before buffers. Commit log is flushed once all buffers are flushed.
             # write ahead log; anytime we are about to flush a buffer; FLUSH THE LOG FIRST
             # This ensures Page 116, (b) doesn't happen when buffer on disk has the data but log do not
             # this line flush (write-ahead) log upto the lsn that modified this buffer
@@ -204,6 +229,7 @@ class Buffer:
 class BufferMgr:
     """
     Buffer Manager maintains a pool of buffers.
+
     buffer_ref = bm.pin(Block())
     buffer_ref.pin()
     bm.unpin(buffer_ref)
@@ -228,7 +254,7 @@ class BufferMgr:
         self.buffer_pool: List[Buffer] = [Buffer(self.fm, self.lm) for _ in range(self.num_buffers)]
         self.pool_availability = self.num_buffers
 
-    def flushAll(self, at_txnum):
+    def flushAll(self, at_txnum): # TODO: Rename to flushBufferPool
         """Flush all pages modified by a given transaction"""
         with self._condition:
             for b in self.buffer_pool:

@@ -71,6 +71,12 @@ class Page:
     # If there is not enough room to write the data in the current page;
     #   we will need to append a new block; similar to LogMgr.appendLog(b'log_record')
     def setData(self, start, data):
+        """
+        TODO: Error bound needed. Otherwise,
+        x = bytearray(5)
+        x[2:10] = b'abcefabcd'
+        len(x) # 11
+        """
         if isinstance(data, int):
             data_bin = data.to_bytes(4,'big')  # chosing to convert integer to 4 bytes in big endian, which is the same way we write and read numbers
         elif isinstance(data, str):  # for type str
@@ -105,6 +111,8 @@ class FileMgr:
     Any interaction with file system is handled by this class.
     Interaction includes reading/writing file block into page. It also includes getting the number of blocks in a file and appending if needed.
     For example when log manager is writing to log file or buffer manager is flushing all buffers of a transaction.
+
+    TODO Caution: This class overwrites existing files in getFileHandle. Meaning, file handles are lost when db server die. But then how does server restart is hande gracefully?
     """
     # https://stackoverflow.com/questions/1466000/difference-between-modes-a-a-w-w-and-r-in-built-in-open-function
     def __init__(self, db_name, block_size):
@@ -114,7 +122,6 @@ class FileMgr:
             os.mkdir(os.getcwd() + '/' + db_name)
 
         os.chdir(os.getcwd() + '/' + db_name)
-        # TODO: remove any leftover table?
 
         self._fileHandles = {}
         self.block_size = block_size
@@ -145,14 +152,18 @@ class FileMgr:
             f.write(page.bb)
 
     # Append a new block to the provided (log) file and return the block reference
-    def appendEmptyBlock(self, fileName):
+    def appendEmptyBlock(self, fileName): # TODO: if we are adding removeBlock(to pair to logging block removal) then it makes sense to rename this to appendBlock
         with self._lock:
             f = self.getFileHandle(fileName)
             new_block_number = self.length(fileName)
-            f.seek(self.block_size * new_block_number)  # seek doesn't with a mode
+            f.seek(self.block_size * new_block_number)
             temp_page = Page(self.block_size)
             f.write(temp_page.bb)
         return Block(fileName, new_block_number)
+
+    def removeBlock(self, fileName, block):
+        """TODO: since append happen at the end of file, remove will happen at the end of file as well"""
+        pass
 
     def length(self, file_name):
         """return the length of file in terms of block. Access through transaction to ensure thread safety."""

@@ -27,6 +27,11 @@ db_logger.addHandler(console_handler)
 db_logger.setLevel(logging.CRITICAL)
 
 class SimpleDB:
+    """
+    block number starts at 0.
+    log serial number in log file starts at 1.
+    transaction number starts at 1.
+    """
     def __init__(self, db_name, block_size, buffer_pool_size):
         self.fm: FileMgr = FileMgr(db_name, block_size)
         self.lm: LogMgr = LogMgr(self.fm, db_name + '.log')
@@ -35,7 +40,7 @@ class SimpleDB:
         tx: Transaction = Transaction(self.fm, self.lm, self.bm)
         if self.fm.db_exists:
             print('Recovering...')
-            tx.recover()
+            tx.recover() # Recovery can run anytime; Fig 5.9; but simpleDB chooses to run it during startup
         else:
             print('Created new db...')
             self.mm = MetadataMgr(tx, True) # if db does not existes, then initialize everything

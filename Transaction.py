@@ -4,15 +4,20 @@ import logging
 db_logger = logging.getLogger('SimpleDB')
 
 
-# LogManager sees LogRecords are a bytearray
-# First int of the bytearray tells us what type of LogRecord it is
-
 # This was originally an interface with op(), txNumber() and undo() specific
 # Classes extending this interface also have
 #   static writeToLog() to build log byte array
 #   Constructor to parse log byte array and extract txnum, block info, block offset, value
 #       These parsed values are to be used by aforementioned op(), txNumber() and undo() method
 class LogRecord:
+    """
+    Collection of utility function to read and write to log file.
+
+    writeToLog(dict) writes to log file
+    createLogRecord(bytearray) returns the values from log records in a tuple
+    undo(tx, [log params]) undo changes made to a buffer
+    toString(bytearray) returns a string representation of a log record
+    """
     CHECKPOINT = 0
     START = 1
     COMMIT = 2
@@ -23,7 +28,7 @@ class LogRecord:
     # write log(byte array) from log parameters; return lsn
     #   writeToLog(lm=lm, op=LogRecord.SETINT, txnum=10, blk_file='log.file', blk_num=10, blk_offset=80, value=100)
     #   will generate appropriate log byte array and call lm.appendLog
-    # Equivalent to static method writeToLog of SetStringRecord class
+    # Equivalent to book's static method writeToLog of SetStringRecord class
     @staticmethod
     def writeToLog(**log_param):
         if log_param['op'] == LogRecord.CHECKPOINT:
@@ -42,6 +47,8 @@ class LogRecord:
             temp_page.setData(txnum_offset, log_param['txnum'])
             db_logger.info('Logging ' + LogRecord.toString(temp_page.bb))
             return log_param['lm'].appendLog(temp_page.bb)
+
+        # Log Record generation per data type
         elif log_param['op'] == LogRecord.SETSTRING:
             op_offset = 0
             txnum_offset = op_offset + 4
@@ -115,7 +122,7 @@ class LogRecord:
         elif op == LogRecord.SETSTRING:
             tx.setString(temp_blk, blk_offset, old_val, False)
         else:
-            pass # TODO: byte type and block append?
+            pass # TODO: byte type and block append
         tx.unpin(temp_blk)
 
     # from log byte array get log parameters
@@ -150,32 +157,36 @@ class LogRecord:
             old_val = temp_page.getStr(4 + 4 + (4 + len(blk_file)) + 4 + 4)
             return '<SETSTRING, ' + str(txnum) + ', ' + blk_file + ', ' + str(blk_num) + ', ' + str(blk_offset) + ', ' + str(old_val) + '>'
 
-
-# RM treats db log as the source of truth; Therefore to maintain durability RM must flush logs to disk before completing a transaction
-# Read/process log
-#   Write log record
-#   roll back transaction
-#   recover after system crash
-
-# Proper shutdown:
-#   All incomplete transaction should be rolled back
-#   All completed transaction should be commited
-
-# Transaction completion:
-#   For undo only algorithm, we are forced to flush the buffers to disk before writing commit
-#       one problem is if commit log fails, recovery will undo the transaction without commit log
-# Transaction Update:
-#   If buffer updates are on disk, but not on log, those updates will get reverted by recovery
-#       To prevent that from happening, we flush logs before we flush a buffer, for whatever reason i.e. buffer swap
-
-# There are three types of loggable activity
-# Start record when a transaction were created
 class RecoveryMgr:
+    """
+    Each transaction gets its own recovery manager. That class is responsible for generating all log record for that transaction.
+    For example, recovery manager constructor write the START tx log record.
+    Other methods such as commit, rollback, recovery, setInt and setString write corresponding log records.
+
+    During recovery(during startup) database does UNDO only recovery that goes over the log page once and undo any changes made by an incomplete tx.
+    This is assuming any tx with commit/rollback records was completed successfuly.
+    This also assumes any tx without commit/rollback records was not completed successfully, and changed made by this tx needs to be undone.
+
+    (Pargraph 1 in page 113)
+    UNDO only recovery requires guarantee that committed/roll-backed transaction flushed a COMMIT/ROLLBACK log in the log file.
+    This is ensured by writing and flushing COMMIT/ROLLBACK message(before flushing buffer) as part of commit/rollback operation; implemented in RecoveryMgr.commit()
+
+    (Pargraph 1 in page 116)
+    UNDO only modification requires all changes to buffer has a corresponding update log entry.
+    There can not some changes to a buffer without a corresponding log record.
+    This is ensured by flushing log before flushing buffer, or known as write-ahead-log; implemented in Buffer.flushDirtyBufferWithLog()
+
+    (Paragraph 2 in section 5.3.5 in page 115)
+    It is inefficient to flush log and flush buffer with every change.
+    To solve this, we maintain in memory log and buffers in-memory until,
+    - buffer needed to be swapped out by a new block request (flush both log and buffer Buffer.assignToBlock()
+    - log page is full (flush log only) LogMgr.appendLog()
+    """
     def __init__(self, tx, txnum, lm, bm):
-        self.tx = tx
-        self.txnum = txnum
-        self.lm = lm
-        self.bm = bm
+        self.tx: Transaction = tx
+        self.txnum = txnum # TODO: redundant, txnum should be accessible from tx
+        self.lm: LogMgr = lm
+        self.bm: BufferMgr = bm
 
         LogRecord.writeToLog(lm=self.lm, op=LogRecord.START, txnum=self.txnum)
 
@@ -183,21 +194,20 @@ class RecoveryMgr:
     # Undo only recovery algorithm forces all buffer to disk before writing(and flushing) the commit log
     # So, when recovering we can go backward and only undo changes if the transaction was not complete(commit/rollback)
     def commit(self):
-        # during commit, we flush all buffers modified by a transaction
-        # Although this line might call lm.flushPage multiple times, due to lsn logic, not all will get called
+        """
+        (5.4.3.1 Undo Only recovery; following three lines corresponds three steps of fig 5.7)
+        We guarantee durability by flushing a COMMIT log as part of commit operation.
+        Encountering COMMIT log implies all previous logs entries have been flushed to disk because flushing by lsn implies all prior lsn have been flushed.
+        """
+        # Although this line will call lm.flushPage multiple times, not all will incur disk write because lsn is compared against last_saved_lsn
         self.bm.flushAll(self.txnum)
-
+        # writeToLog writes to memory; flushPage writes it to disk
         lsn = LogRecord.writeToLog(lm=self.lm, op=LogRecord.COMMIT, txnum=self.txnum)
         self.lm.flushPage(lsn)
 
-    # Performs a single backward pass.
     # Since each Transaction has its own recovery manager, it should know what transaction we are in
-    # Go backward in the log and undo all updates() that belongs to the transaction
-    # Finally add a rollback log for that transaction
     def rollback(self):
-        # Make a single backward pass through the log
-        # Each time we see a update log for self.txnum, we call the undo method of transaction
-        # Continue until the start record of self.txnum was reached
+        """Makes a single backward pass in the log and undo all changed made by this tx until the START commit was found. Finally add ROLLBACK log record."""
         for l in self.lm.iterator():
             log_data = LogRecord.createLogRecord(l) # from byte array extract log record information
             op, txnum = log_data[0], log_data[1]
@@ -210,28 +220,8 @@ class RecoveryMgr:
         lsn = LogRecord.writeToLog(lm=self.lm, op=LogRecord.ROLLBACK, txnum=self.txnum)
         self.lm.flushPage(lsn)
 
-    # Undo, followed by Redo
-    # Step 1: Go log backwards and undo the updates() that belongs to transaction that were not committed/rolled back.
-    # Step 2: Go log forward and redo the updates() that belongs only commited transactions
-
-    # During Transaction updating
-    #   If each buffer update flush log page that will result in poor performance as explained in 4.2
-    #       Therefore buffer update logs are only flushed when buffer manager is swapping them out or log page is full
-    # During Transaction completion
-    #   we flush all buffers associated with the transaction
-    #   then we write commit log entry <COMMIT, txnum>
-    #   then we flush the log page
-    # Undo only (Make sure buffers is flushed to disk before updating log so redo step is not necessary)
-    #   We know all commited transactions are
-
-    # Performs a single backward pass.
-    # Recovery manger is oblivious current state of the database;
-    # it writes old values without looking the current value
-    # Recovery requirs a dummy tx, meaning a redundent <start x> will be created before <checkpoint>
-    #   but it is not a problem since we never look at logs before <Checkpoint> anyway
     def recover(self):
-        # go backward and only undo changes if the transaction was not complete(commit/rollback)
-        # transaction without commit/rollback are treated as incomplete and their changes should be reversed
+        """Makes a single backward pass in the log file and undoes any changes made by incomplete tx"""
         completed_tx = set()
         for l in self.lm.iterator():
             log_data = LogRecord.createLogRecord(l)
@@ -254,7 +244,7 @@ class RecoveryMgr:
 
     # Transaction calls these set methods to write to log
     # we want to save the old value in the log; so undo recovery can replace current value with this old value
-    # Choosing to use static method instead of SetIntRecord.writeToLog
+    # Choosing to use static method instead of Book's SetIntRecord.writeToLog
     def setInt(self, target_buffer, block_offset):
         old_val = target_buffer.page.getInt(block_offset)
         return LogRecord.writeToLog(
@@ -399,7 +389,7 @@ class ConcurrencyMgr:
 
 class BufferList:
     def __init__(self, bm):
-        self.bm = bm
+        self.bm: BufferMgr = bm
 
         self.block_buffer_map = {}
         self.block_pin_history = []
@@ -476,7 +466,9 @@ class BufferList:
 # Normal db shutdown involves completing all transactions and flushing buffers into disk
 class Transaction:
     """
-    Transaction is a series of operations that behaves as a single operation
+    Transaction is a series of operations that behaves as a single operation.
+    To make an operation on a block, tx first need to pin it and then setX/getX method.
+    At the end we either commit or rollback the transaction.
     """
     # Used together to synchronously increase txnum
     _lock = threading.Lock()
@@ -488,8 +480,8 @@ class Transaction:
         self.bm : BufferMgr = bm
 
         self.txnum = Transaction.get_next_txnum()
-        self.cm : ConcurrencyMgr = ConcurrencyMgr()
         self.rm : RecoveryMgr = RecoveryMgr(self, self.txnum, self.lm, self.bm) # I am unsure everytime I am using self.tx inside RM
+        self.cm : ConcurrencyMgr = ConcurrencyMgr()
         self.bufferList : BufferList = BufferList(self.bm)
         # Currently there is no system to prevent new transaction to begin during recovery
 
@@ -527,7 +519,7 @@ class Transaction:
     # Read and returns value (uses CM for locking)
     def getInt(self, target_block, block_offset):
         self.cm.sLock(target_block)
-        buf_ref = self.bufferList.getBuffer(target_block) # TODO: this returns None if the block is not pinned by this tx
+        buf_ref = self.bufferList.getBuffer(target_block) # TODO: currently throws KeyError, it should returns None if tx has not pinned this block yet
         return buf_ref.page.getInt(block_offset)
 
     def getString(self, target_block, block_offset):
@@ -570,6 +562,7 @@ class Transaction:
 
     # returns the new block references
     def append(self, filename):
+        """TODO: Once we have table level lock - we should not need to maintain block lock. This also implies, once we add new block we don't need to acquire lock on the new block."""
         self.cm.xLock(Block(filename, -1))
         return self.fm.appendEmptyBlock(filename)
 
@@ -588,7 +581,7 @@ if __name__ == "__main__":
 
     if fig == 501:
         # RecoveryTest - Not mentioned the book
-        fm: FileMgr = FileMgr('simpledb', 400)
+        fm: FileMgr = FileMgr('txtest', 400)
         lm: LogMgr = LogMgr(fm, 'simpledb.log')
         bm: BufferMgr = BufferMgr(fm, lm, 2)
 
@@ -640,7 +633,7 @@ if __name__ == "__main__":
 
     elif fig == 5.19:
         # Fig 5.19 ConcurrencyTest; Testing Concurrency class
-        fm = FileMgr('simpledb', 400)
+        fm = FileMgr('txtest', 400)
         lm = LogMgr(fm, 'simpledb.log')
         bm = BufferMgr(fm, lm, 8)
 
@@ -718,7 +711,7 @@ if __name__ == "__main__":
 
     elif fig == 5.3:
         # Fig 5.3 TxTest; Testing Transactions
-        fm = FileMgr('simpledb', 400)
+        fm = FileMgr('txtest', 400)
         lm = LogMgr(fm, 'simpledb.log')
         bm = BufferMgr(fm, lm, 8)
 
@@ -740,6 +733,7 @@ if __name__ == "__main__":
         tx2.setInt(blk, 80, newival, True)
         tx2.setString(blk, 40, newsval, True)
         tx2.commit()
+        print(lm)
 
         tx3 = Transaction(fm, lm, bm)
         tx3.pin(blk)
@@ -748,8 +742,10 @@ if __name__ == "__main__":
         tx3.setInt(blk, 80, 9999, True)
         print('pre-rollback value at loc 80 = ', str(tx3.getInt(blk, 80)))
         tx3.rollback()
+        print(lm)
 
         tx4 = Transaction(fm, lm, bm)
         tx4.pin(blk)
         print('post-rollback value at loc 80 = ', str(tx4.getInt(blk, 80)))
         tx4.commit()
+        print(lm)
