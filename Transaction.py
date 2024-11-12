@@ -1,17 +1,21 @@
+# https://www.amazon.com/Principles-Transaction-Processing-Kaufmann-Management/dp/1558606238
+# https://www.amazon.com/Transaction-Processing-Concepts-Techniques-Management/dp/1558601902
+# https://www.amazon.com/Concurrency-Control-Recovery-Database-Systems/dp/0201107155
+
 from BufferPool import *
 import time
 import logging
 db_logger = logging.getLogger('SimpleDB')
 
 
-# This was originally an interface with op(), txNumber() and undo() specific
+# In the book, this was originally an interface with op(), txNumber() and undo() specific
 # Classes extending this interface also have
 #   static writeToLog() to build log byte array
 #   Constructor to parse log byte array and extract txnum, block info, block offset, value
 #       These parsed values are to be used by aforementioned op(), txNumber() and undo() method
 class LogRecord:
     """
-    Collection of utility function to read and write to log file.
+    Collection of static utility function to read and write to log file.
 
     writeToLog(dict) writes to log file
     createLogRecord(bytearray) returns the values from log records in a tuple
@@ -125,8 +129,7 @@ class LogRecord:
             pass # TODO: byte type and block append
         tx.unpin(temp_blk)
 
-    # from log byte array get log parameters
-    # then return human form
+    # extract log parameters from log byte array to build human-readable form
     @staticmethod
     def toString(log_bytearray):
         temp_page = Page(log_bytearray)
@@ -159,6 +162,10 @@ class LogRecord:
 
 class RecoveryMgr:
     """
+    RecoveryMgr is responsible for logging that provides atomicity and durability for the database.
+    Each tx gets it own RecoveryMgr instance. Multiple tx use their own RecoveryMgr to write to the same log file.
+    All interation with the log file is done through the static utility function by LogRecord class.
+
     Each transaction gets its own recovery manager. That class is responsible for generating all log record for that transaction.
     For example, recovery manager constructor write the START tx log record.
     Other methods such as commit, rollback, recovery, setInt and setString write corresponding log records.
@@ -242,7 +249,6 @@ class RecoveryMgr:
         lsn = LogRecord.writeToLog(lm = self.lm, op = LogRecord.CHECKPOINT)
         self.lm.flushPage(lsn)
 
-    # Transaction calls these set methods to write to log
     # we want to save the old value in the log; so undo recovery can replace current value with this old value
     # Choosing to use static method instead of Book's SetIntRecord.writeToLog
     def setInt(self, target_buffer, block_offset):
@@ -269,47 +275,43 @@ class RecoveryMgr:
             old_val=old_val
         )
 
-# LockTable grants locks to a transaction
-# This class in instantiated only once
-# And that single instance is referenced by all instance of concurrency manager
-#   This global variable is used all transactions to request and release locks for all Tx
 class LockTable:
+    """
+    Database maintains a single instance of LockTable.
+    LockTable grants locks on block; and maintains list of all blocks with locks and their lock counts/status.
+    Each tx has an instance of ConcurrencyMgr, and tx requests locks on block from LockTable through the ConcurrencyMgr instance.
+    """
     import collections
     _all_locks = collections.defaultdict(int) # TODO: check if using defaultdict is introducing any bug
 
     def __init__(self):
         self._condition = threading.Condition()
 
-    # def getLockVal(self, target_block):
-    #     if target_block in LockTable._all_locks:
-    #         return LockTable._all_locks[target_block]
-    #     else:
-    #         return 0
-
     # similar to BufferMgr.pin
     def sLock(self, target_block):
         with self._condition:
             start = time.time()
-            # we will wait if there is a xlock and we have not waited for at least 10 sec to release that xlock
-            while LockTable._all_locks[target_block] < 0 and (time.time() - start) < 10:
+            # we will wait if there is a xlock
+            while LockTable._all_locks[target_block] < 0 and (time.time() - start) < 10: # <= is not necessary because -1 is used to identify xlock
                 self._condition.wait(2.0) # within this 10 seconds, every 2 sec check if xlock was released
 
-            # Since multiple threads are woken up; another thread might race first to xlock before current thread
-            # That's is when this check will fail; and prompt the client to try again
+            # Since multiple threads are woken up at the same time; another thread might race first to xlock before this thread
             if LockTable._all_locks[target_block] < 0:
                 raise Exception('Tx aborted because it waited to long to acquire slock or another Tx raced first to acquire the slock. Try again.')
             LockTable._all_locks[target_block] += 1
 
     # We use Approximate Deadlock Detection to prevent Tx from waiting to obtain for a lock for too long
     # Here, we prevent deadlock by aborting Tx that is waiting too long(10 sec) for a lock.
-    # Long wait time doesn't mean deadlock, it could also mean a lot of data is being written
+    # Long wait time doesn't mean deadlock, it could also mean another transaction has a lot to do
     # Meaning, our approach react to situation that could potentially lead to deadlock, which may or may not be an actual deadlock
-    # similar to BufferMgr.pin
     def xLock(self, target_block):
+        """
+        Behaves similar to BufferMgr.pin
+        """
         with self._condition:
             start = time.time()
             # > 1 is because slock is obtained before attempting to xlock
-            # meaning, if a transaction has xlock on a block, it is implies that it also have slock on it
+            # meaning, if a tx has xlock on a block, it is implied that the tx also have slock on it
             while LockTable._all_locks[target_block] > 1 and (time.time() - start) < 10:
                 self._condition.wait(2.0)
 
@@ -328,41 +330,39 @@ class LockTable:
                 del LockTable._all_locks[target_block]
                 self._condition.notify_all()
 
-# Concurrency Manager responsible for correctly executing concurrent transaction; it uses lock to do so.
-# We know serial schedules are correct due to proof by contradiction.
-# Let us say we have to run following two transactions.
-# We want to run T1 first follow by T2. Each transaction has two operations.
+# Concurrency Manager responsible for correctly executing concurrent transaction.
+# Each Transaction is a group of operation the behaves as a single operation.
+# For example, T1 transaction is a group of two operations, and they are W(b1) and W(b2)
+# We know the multiple transaction running in serial have their sub operations correctly scheduled - proof by contradiction.
+# In this example, we have to run following two transactions needs to run concurrently.
+# In serial schedule we will run all sub operation T1 to completion and before running any sub operation of T2.
+# But we will have sub operations of T1 and T2 interleaved - run them in non-serial schedule.
+# We need to find out a schedule that serializable.
+# Meaning, running those sub operation interleaved or in non-serial schedule will be equivalent to running the transactions in series.
+
+# Example, we want to find a schedule running the sub operations of T1 and T2.
+# Correct non-serial schedule will be serializable.
 #       T1: W(b1) W(b2)
 #       T2: W(b1) W(b2)
-# Now we want to run both transactions in parallel.
-# Therefore, we want to run constituent operations in these two transactions in non-serial schedule.
-# Meaning operations from both transactions will interleave.
-# Example 1:
-#   One example of running those constituent operations in non-serial schedule is W1(b1) W2(b1) W1(b2) W2(b2)
+# Example of non-serial schedule 1:
+#   One example of running those sub operations is W1(b1) W2(b1) W1(b2) W2(b2)
 #   This non-serial schedule IS serializable because this schedule is equivalent to running T1 first following by T2
-# Example 2:
+# Example of non-serial schedule 2:
 #   Another example of running those constituent operations in non-serial schedule is W1(b1) W2(b1) W2(b2) W1(b2)
 #   This non-serial schedule IS NOT serializable, because at the end B1 blocks contains update from T1 and B2 block contains update from T2
-# So when running multiple transaction CM needs to find a non-serial schedule that yields same result as running those transactions in series
-# ISOLATION PROPERTY: Is as if we are running on transaction at a time.
+#   In fact, in this case CM will grant T1 a xlock on B1. If CM also grant T2 a xblock on B2, then we have a deadlock.
+#   Both transaction will be waiting for the other transaction to release their lock
+
 # A non-serial schedule is called serializable if it produces some serial schedule.
-# CM uses locking to ensure a non-serial schedule is serializable
-# Any conflicting transactions are forced to run in series
-
-# In this case CM will grant T1 a xlock on B1. If CM also grant T2 a xblock on B2, then we have a deadlock.
-# Both transaction are waiting for the other transcation to release their block(block release only happens when transcation is complete)
-
+# Concurrency Manager uses locking to ensure a non-serial schedule is serializable
+# Any conflicting transactions are forced to run in series by the concurrency manager.
 # When running multiple transaction CM is responsible for finding a non-serial schedule that is serializable
-
-# Each transaction holds its own CM object
-# Each CM object holds the locks held by a transaction in its instance dict
-# Each CM object also holds a reference to global lock table
-# Each CM object request a lock on behalf of the transaction using the global lock table and appends to the instance dict
-
-# CM object request a lock using the global LockTable object
-# But all CM refer to a static instance of lock table
-# This static instance of lock table keeps all locks obtained by all transactions
 class ConcurrencyMgr:
+    """
+    Maintain the dict of all locks held by a transaction.
+    sLock and xLock method create the following dict entries, and release method removed them all.
+    tx_locks = { blk1: 'S', blk2: 'X'}
+    """
     _global_locktable = LockTable() # ConcurrencyMgr.db_locktable
 
     def __init__(self):
@@ -372,12 +372,11 @@ class ConcurrencyMgr:
         if target_block not in self.tx_locks:
             ConcurrencyMgr._global_locktable.sLock(target_block)
             self.tx_locks[target_block] = 'S'
-        # else CM always has a sLock no the block
 
     def xLock(self, target_block):
         if not (target_block in self.tx_locks and self.tx_locks[target_block] == 'X'):
             # this block is already in the tx_locks list and we have xLock on it
-            self.sLock(target_block)
+            self.sLock(target_block) # TODO Why always acquire slock before obtaining xlock?
             ConcurrencyMgr._global_locktable.xLock(target_block)
             self.tx_locks[target_block] = 'X'
 
@@ -386,8 +385,12 @@ class ConcurrencyMgr:
             ConcurrencyMgr._global_locktable.unlock(block)
         self.tx_locks.clear()
 
-
 class BufferList:
+    """
+    Captures block/buffer usage.
+     - mapping to get buffer ref from block ref {blk1_ref : buf1_ref, ... }
+     - block pin history [blk1, blk2, blk1, blk1, blk2, blk3, ...]
+    """
     def __init__(self, bm):
         self.bm: BufferMgr = bm
 
@@ -414,76 +417,58 @@ class BufferList:
     def getBuffer(self, target_block):
         return self.block_buffer_map[target_block]
 
-# Everything from a client is a sequence of transaction
-# Transaction is a GROUP of operation the behaves as a SINGLE operation
-
-# A single Transaction has follow properties,
-#   Atomicity - (Recovery Manger) Either all or nothing will commit.
-#   Durability - (Recovery Manger) Commited transaction are permanent.
-# Multiple transaction have the following properties,
-#   Consistency - (Concurrency Manager)
-#       Each transaction will leave the database in valid state(modification rules are predefine and predictable0.
-#       For example, if primary key contrains are not met, the transaction will be rolled back.
-#       Database engine must detect when a conflict is about to occur and take corrective action(i.e. make one client wait)
-#   Isolation - (Concurrency Manager) Concurrent transaction does not interfare with each other. It is as if they ran in series.
-
-
-# A client's interation with the database is essentially a series of transaction
-# At a given time only one transaction open(not commited/rolled back)
-# ? A new transaction will imply closing previous transaction
-# Transaction is a collection of work done to the database, i.e. a collection of select and update statement
-# A transaction is a correctly scheduled call to write data
-# Writing data can occur at different granularity level, at data level using setInt/setStr, or block level
-# When multiple transactions are running; concurrency manager interleaves these calls to setInt/setStr
-# Serial schedule is always correct - proof by contradiction.
-# Lets say we have to run following two transactions; We need to run T1 before T2.
-#       T1: W(b1) W(b2)
-#       T2: W(b1) W(b2)
-# Now we want to run both transactions in parallel so that their result is the same as running them in series.
-# We want to run both transactions in non-serial schedule.
-# A non-serial schedule is called serializable if it produces some serial schedule.
-#   - serial schedule ensures we run T1 before T2
-#       W1(b1) W1(b2) W2(b1) W2(b2)
-#   - non serial schedule
-#       W1(b1) W2(b1) W1(b2) W2(b2)
-# Non serial schedule is serializable if it produces the same result as some other serial schedule
-# A scheduling is correct if and only if it is serializable
-# Concurrency manager will generate non-serial schedule that can be serializable
-# CM will use locking table to ensure all generate schedules are serializable
-# Transaction uses an instance of CM,which holds an instance of lock table, that is used to obtain locks on a block
-
-# lock is imposed per block, exclusive lock and shared lock
-
 # Transaction uses
 #   Recovery Manager(read/write logs recording changes to buffer) and (Multiple transactions will write in the log at ths ame time)
 #       Any uncommited transaction(either explicit rollback/system crash) must be undone properly by Recovery Manager
 #   Concurrency manager to provide controlled access to buffers
 
-# Workflow
-# pin the buffer that adds to the internal buffer list held per transaction
-# get/set method requres same block reference, which is fetched from the aforementioned list
-
 # Normal db shutdown involves completing all transactions and flushing buffers into disk
 class Transaction:
     """
-    Transaction is a series of operations that behaves as a single operation.
-    To make an operation on a block, tx first need to pin it and then setX/getX method.
+    Transaction is a GROUP of operations that behaves as a SINGLE operation.
+    Each client communicates to the database in a series of transaction.
+    Opening a new transaction implies closing previous transaction.
+    Transaction object starts by pinning a block and call setX/getX method on it.
     At the end we either commit or rollback the transaction.
+    Terminating the database involves completing all pending transaction.
+
+    tx = Transaction()
+    tx.pin(blk = Block()) >>> BufferList.pin >>> BufferPool.pin
+    tx.setInt(blk, offset, 10) >>> rm.setInt and buffer.setInt(to be implemented)
+    tx.commit() >>> rm.commit(), cm.release() and bufferList.unpin(which is bufferPool.unpin)
+
+    Transaction object uses,
+    - RecoveryMgr object to write to log file
+    - ConcurrencyMgr object to acquire/release locks on blocks before reading/writing to buffer
+    - BufferList object to maintain a list of pinned blocks
+
+    We interact with block references.
+    These block references are used internally to work with buffer pool.
+    For example, we use the block reference to get buffer reference. i.e. self.bufferList.getBuffer(target_block)
+
+    LockTable maintains,
+    - block lock status {blk1: 1, blk2:3, blk3:-1}
+    ConcurrencyMgr maintains,
+    - per transaction block lock status { blk1: 'S', blk2: 'X'}
+    - Uses LockTable status dict before granting lock request to a transaction
+    BufferList maintains,
+    - We can use the buffers once locks are obtained through ConcurrencyMgr
+    - {blk1_ref : buf1_ref, ... } so we can get buffer reference using block reference
+    - [blk1, blk2, blk1, blk1, blk2, blk3, ...] list of blk references to pin/unpin the correct amount
     """
     # Used together to synchronously increase txnum
     _lock = threading.Lock()
     _next_txnum = 0
 
     def __init__(self, fm, lm, bm):
-        self.fm : FileMgr = fm
-        self.lm : LogMgr = lm
-        self.bm : BufferMgr = bm
+        self.fm: FileMgr = fm
+        self.lm: LogMgr = lm
+        self.bm: BufferMgr = bm
 
         self.txnum = Transaction.get_next_txnum()
-        self.rm : RecoveryMgr = RecoveryMgr(self, self.txnum, self.lm, self.bm) # I am unsure everytime I am using self.tx inside RM
-        self.cm : ConcurrencyMgr = ConcurrencyMgr()
-        self.bufferList : BufferList = BufferList(self.bm)
-        # Currently there is no system to prevent new transaction to begin during recovery
+        self.rm: RecoveryMgr = RecoveryMgr(self, self.txnum, self.lm, self.bm)
+        self.cm: ConcurrencyMgr = ConcurrencyMgr()
+        self.bufferList: BufferList = BufferList(self.bm)
 
     # Transaction lifespan
     def commit(self):
@@ -498,17 +483,28 @@ class Transaction:
         self.cm.release()
         self.bufferList.unpinAll()
 
-    # TODO: Find out what is the idle place/setup to call recover()? Every startup doesn't make much sense.
-    # any single transaction can trigger recovery of the entire database - why?
-    # In example, we create a dummy transaction to run recovery? Why not make this a static method?
+    # Unlike commit/rollback, there is no locking during startup recovery because the database server itself is running the recovery
+    # database server is not ready to accept new transaction from client yet
+    # Since no clients interacting with the database, there is no need for locking
     def recover(self):
-        # Unlike commit/rollback, there is no locking during recovery because the db server is running the recovery in a single transaction
-        # Since multiple clients are not running, there is no need for locking - maintaining isolation property
+        """
+        We use a dummy transaction to run recovery.
+        This dummy transaction appends the following three log records at the end of log file.
+
+        ...new transaction log goes here
+        <COMMIT X>
+        <CHECKPOINT>
+        <START X>
+        ...previous transaction log goes here
+        """
         self.bm.flushAll(self.txnum) # This line is not necessary if recovery is done during startup. Buffer manager is empty at this point.
         self.rm.recover()
 
     # Transaction buffer access
     def pin(self, target_block):
+        """
+        Similar to bufferPool.pin(blk)
+        """
         # buffer manager holds mapping between page/block mapping for all transaction
         # self.bufferList holds mapping of blocks used by this transaction
         self.bufferList.pin(target_block)
@@ -530,7 +526,7 @@ class Transaction:
     # Write value (Uses CM for locking and RM for logging)
     def setInt(self, target_block, block_offset, new_val, okToLog):
         self.cm.xLock(target_block)
-        buf_ref: Buffer = self.bufferList.getBuffer(target_block)
+        buf_ref: Buffer = self.bufferList.getBuffer(target_block) # TODO This line will throw KeyError if the block has not been pinned yet
         lsn = -1
         if okToLog:
             lsn = self.rm.setInt(buf_ref, block_offset)
@@ -548,8 +544,6 @@ class Transaction:
         buf_ref.page.setData(block_offset, new_val)
         buf_ref.setModified(self.txnum, lsn)
 
-    # Transaction file manager access
-    # Why we need file access? Can't we make all update through buffer
     def availableBuffers(self):
         return self.bm.pool_availability
 
@@ -561,6 +555,7 @@ class Transaction:
         return self.fm.length(filename)
 
     # returns the new block references
+    # 2nd paragraph of 5.4.5
     def append(self, filename):
         """TODO: Once we have table level lock - we should not need to maintain block lock. This also implies, once we add new block we don't need to acquire lock on the new block."""
         self.cm.xLock(Block(filename, -1))
@@ -577,11 +572,11 @@ class Transaction:
 
 
 if __name__ == "__main__":
-    fig = [5.3, 5.19, 501][2]
+    fig = [5.3, 5.19, 501][1]
 
     if fig == 501:
         # RecoveryTest - Not mentioned the book
-        fm: FileMgr = FileMgr('txtest', 400)
+        fm: FileMgr = FileMgr('recoverytest', 400)
         lm: LogMgr = LogMgr(fm, 'simpledb.log')
         bm: BufferMgr = BufferMgr(fm, lm, 2)
 
@@ -628,12 +623,12 @@ if __name__ == "__main__":
             tx3.rollback()
 
             print('init and modify - complete')
-            for l in lm.iterator():
-                print(LogRecord.toString(l))
+            print(lm)
 
     elif fig == 5.19:
         # Fig 5.19 ConcurrencyTest; Testing Concurrency class
-        fm = FileMgr('txtest', 400)
+        # Output files are not binary compatible because thread could start in any order
+        fm = FileMgr('concurrencytest', 400)
         lm = LogMgr(fm, 'simpledb.log')
         bm = BufferMgr(fm, lm, 8)
 
@@ -706,8 +701,7 @@ if __name__ == "__main__":
         t2.join()
         t3.join()
 
-        for l in lm.iterator():
-            print(LogRecord.toString(l))
+        print(lm)
 
     elif fig == 5.3:
         # Fig 5.3 TxTest; Testing Transactions
