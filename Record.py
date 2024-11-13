@@ -2,11 +2,12 @@ from Transaction import *
 import logging
 db_logger = logging.getLogger('SimpleDB')
 
-# Schema hold record(row's) schema
+# In a dictionary, schema object holds the table schema
+# It holds a list of (fieldname, type, length)
 # Schema stores a list of triples (field_name, field_type, field_length)
-# {field_name : (field_type, field_length)
+# field_info = {field_name : (field_type, field_byte_length), ...}
 class Schema:
-    """Maintains a list of ``{field_name:{field_type, field_byte_length}}`` for each table"""
+    """Maintains a dict capturing column info {field_name:{field_type, field_byte_length}}"""
 
     def __init__(self, *field_data):
         self.field_info = {}
@@ -25,49 +26,53 @@ class Schema:
     def getFields(self):
         return self.field_info.keys()
 
-    def __str__(self):
+    def __repr__(self):
         return self.pretty_str
 
 
 # Layout hold record's field and slot side; field offset within a slot
 class Layout:
-    """Calculates field offset from schema info"""
+    """
+    Calculates field offset + slot size from table schema.
+    Since our records of fixed size, slot size works as Record Identifier.
+    For variable length record we need to use an ID table.
+    """
 
     def __init__(self, schema, offset = None, slot_size = None):
         self.schema = schema
 
+        # new table
         if not offset and not slot_size:
             self.offset = {} # Holds byte offset for all fields inside a record
-            field_pos = 4 # starting at 4 byte mark because the first 4 byte is int value representing is_slot_full flag
+            field_pos = 4 # starting at 4 byte mark because the first 4 byte is int empty(0)/full(1) flag for this slot
             for sk, sv in self.schema.field_info.items():
                 self.offset[sk] = field_pos
                 field_pos += (sv['field_byte_length'] if sv['field_type'] == 'int' else (sv['field_byte_length'] + 4))
             self.slot_size = field_pos
+        # table exists (read metadata table)
         else:
             # we are reading everything from table_catalog and field_catalog table
             #   therefore no calculation is necessary
             self.offset = offset
             self.slot_size = slot_size
 
-    def __str__(self):
+    def __repr__(self):
         return 'Layout :: \n' + str(self.schema) + 'Slot size: ' + str(self.slot_size)
 
 # file is a sequence of blocks
 # record files are a sequence of record pages/blocks
 # record page contains sequence of slots
-# slot are one byte + record
+# slot are one empty(0)/full(1) indicator byte + record
 
-# RM is responsible for interpreting the values in a record blocks/page.
+# Record Page, Record Manager, class is responsible for interpreting the values in a record blocks/page.
 # RM uses Layout(slot size) and Schema(record info) class to update record page
 
 # Tables are a collection of field(columns) and records(row)
-# Record manager keeps the structure of the record(spanned/unspanned; homogeneous/nonhomogeneous) in the block
 # Implementing 6.2.1, homogeneous, unspanned, fixed-length records
-# block/page contains records, we call it record page
 
 # beforeFirst -> firstRecord; move current_slot_index to -1
 # insertAfter -> nextEmpty; move
-class RecordPage: # Also being called Record Manager
+class RecordPage: # Also called Record Manager in the Book
     """Writes record data to a table block using layout"""
     def __init__(self, tx, blk, layout):
         self.tx: Transaction = tx
@@ -254,10 +259,128 @@ class TableScan:
     def currentRecordID(self):
         return RecordID(self.rp.blk.block_number, self.current_slot_index)
 
-
     def hasField(self, field_name):
         return field_name in self.layout.offset.keys()
 
     def closeRecordPage(self):
         if self.rp:
             self.tx.unpin(self.rp.blk)
+
+
+if __name__ == '__main__':
+    fig = [6.11, 6.15, 6.18][2]
+
+    if fig == 6.18:
+        # Fig 6.18 TableScanTest
+        fm: FileMgr = FileMgr('tabletest', 400)
+        lm: LogMgr = LogMgr(fm, 'simpledb.log')
+        bm: BufferMgr = BufferMgr(fm, lm, 2)
+        tx: Transaction = Transaction(fm, lm, bm)
+        sch: Schema = Schema()
+        sch.addField('A', 'int', 4)
+        sch.addField('B', 'str', 9)
+        layout: Layout = Layout(sch)
+
+        ts: TableScan = TableScan(tx, "T", layout)
+        print('Insertion')
+        rand_val = [49, 34, 40, 30, 1, 17, 18, 45, 27, 5, 7, 27, 43, 9, 31, 21, 2, 2, 28, 16, 44, 3, 14, 44, 47, 41, 22, 0,
+                    23, 42, 3, 25, 3, 50, 29, 35, 28, 45, 50, 6, 49, 30, 18, 16, 42, 6, 8, 45, 11, 31]
+        rand_count = 0
+        ts.firstRecord()
+        for i in range(50):
+            ts.nextEmptyRecord()
+            # temp_val = random.randint(0, 50)
+            temp_val = rand_val[rand_count]
+            rand_count += 1
+            ts.setInt('A', temp_val)
+            ts.setString('B', 'rec' + str(temp_val))
+            print('inserting ' + str(ts.currentRecordID()) + '; ' + str(temp_val) + ' rec' + str(temp_val))
+
+        print('Deletion')
+        count = 0
+        ts.firstRecord()
+        while ts.nextRecord():
+            a = ts.getInt('A')
+            b = ts.getString('B')
+            if a < 25:
+                count += 1
+                print('Deleting ' + str(ts.currentRecordID()) + ' ; value ' + str(a) + ' ' + b)
+                ts.deleteRecord()
+
+        print('Retained')
+        ts.firstRecord()
+        while ts.nextRecord():
+            a = ts.getInt('A')
+            b = ts.getString('B')
+            print('Retained ' + str(ts.currentRecordID()) + ' ; value ' + str(a) + ' ' + b)
+
+        ts.closeRecordPage()
+        tx.commit()
+
+        print(lm)
+
+    elif fig == 6.15:
+        # Fig 6.15 RecordTest; Testing RecordPage, Schema, Layout
+        fm: FileMgr = FileMgr('recordtest', 400)
+        lm: LogMgr = LogMgr(fm, 'simpledb.log')
+        bm: BufferMgr = BufferMgr(fm, lm, 8)
+
+        tx: Transaction = Transaction(fm, lm, bm)
+        blk: Block = tx.append('testfile')
+        tx.pin(blk)
+        sch: Schema = Schema()
+        sch.addField('A', 'int', 4)
+        sch.addField('B', 'str', 9)
+        layout: Layout = Layout(sch)
+        rp: RecordPage = RecordPage(tx, blk, layout)
+        rp.format()
+
+        print("RecordPage init")
+        rand_val = [49, 34, 40, 30, 1, 17, 18, 45, 27, 5, 7, 27, 43, 9, 31, 21, 2, 2, 28, 16, 44, 3, 14, 44, 47, 41, 22, 0,
+                    23, 42, 3, 25, 3, 50, 29, 35, 28, 45, 50, 6, 49, 30, 18, 16, 42, 6, 8, 45, 11, 31]
+        rand_count = 0
+        next_empty_slot = rp.insertAfter(-1)
+        while next_empty_slot >= 0:
+            rec_val = rand_val[rand_count]
+            rand_count += 1
+            rp.setInt(next_empty_slot, 'A', rec_val)
+            rp.setString(next_empty_slot, 'B', 'rec' + str(rec_val))
+            print('Insert slot ' + str(next_empty_slot) + ' [' + str(rec_val) + ', rec' + str(rec_val) + ']')
+            next_empty_slot = rp.insertAfter(next_empty_slot)
+
+        print("RecordPage deletion")
+        next_used_slot = rp.nextAfter(-1)
+        del_counter = 0
+        while next_used_slot >= 0:
+            a = rp.getInt(next_used_slot, 'A')
+            b = rp.getString(next_used_slot, 'B')
+            if rp.getInt(next_used_slot, 'A') < 25:
+                del_counter += 1
+                rp.delete(next_used_slot)
+                print('Deleting slot ' + str(next_used_slot) + ' [' + str(a) + ',' + str(b) + ']')
+            next_used_slot = rp.nextAfter(next_used_slot)
+
+        print("RecordPage Retained")
+        next_empty_slot = rp.nextAfter(-1)
+        while next_empty_slot >= 0:
+            a = rp.getInt(next_empty_slot, 'A')
+            b = rp.getString(next_empty_slot, 'B')
+            print('Retained slot ' + str(next_empty_slot) + ' [' + str(a) + ',' + str(b) + ']')
+            next_empty_slot = rp.nextAfter(next_empty_slot)
+
+        tx.unpin(blk)  # Not necessary as commit() unpins all pinned buffers
+        tx.commit()
+
+        print(lm)
+
+    elif fig == 6.11:
+        sch = Schema()
+        sch.addField('cid', 'int', 4)
+        sch.addField('title', 'str', 20)
+        sch.addField('deptid', 'int', 4)
+
+        layout = Layout(sch)
+        print(layout)
+        # for k, v in layout.schema.field_info.items():
+        #     print(k, v['field_byte_length'], layout.offset[k])
+        # print(layout.slot_size)

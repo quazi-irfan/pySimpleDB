@@ -1,12 +1,25 @@
 # https://www.amazon.com/Principles-Transaction-Processing-Kaufmann-Management/dp/1558606238
 # https://www.amazon.com/Transaction-Processing-Concepts-Techniques-Management/dp/1558601902
 # https://www.amazon.com/Concurrency-Control-Recovery-Database-Systems/dp/0201107155
+# https://www.cs.purdue.edu/homes/bb/cs542-06Spr-bb/SCDU-Papa-79.pdf
 
 from BufferPool import *
 import time
 import logging
 db_logger = logging.getLogger('SimpleDB')
 
+# Original MVCC Paper https://dl.acm.org/doi/abs/10.1145/356842.356846
+# TODO: MVCC implementation; Read only tx can see
+# Modification of Transaction.commit() for write query
+#   Record when write tx ends
+#   Add that timestamp to the COMMIT log record
+#   Add that same timestamp to each block the tx have a lock on
+# Modification on BufferList.pin() for read query
+#   Record when read tx start as t
+#   Copy the current block(be in from disk or in-memory) to a new page
+#   Get a list of transaction that commited after time t
+#   Get a list of incomplete transaction started after time t
+#   Undo any changes made by any of these two above type of transactions
 
 # In the book, this was originally an interface with op(), txNumber() and undo() specific
 # Classes extending this interface also have
