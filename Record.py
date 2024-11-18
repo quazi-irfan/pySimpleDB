@@ -2,12 +2,19 @@ from Transaction import *
 import logging
 db_logger = logging.getLogger('SimpleDB')
 
+# Q1 Why we pin inside record page? Wouldn't make sense to pin it inside Tx
+# Q2 My system can't recover from log if we are not populating with empty bytearray(length) with length encoded during format
+
 # In a dictionary, schema object holds the table schema
 # It holds a list of (fieldname, type, length)
 # Schema stores a list of triples (field_name, field_type, field_length)
 # field_info = {field_name : (field_type, field_byte_length), ...}
+# TODO: Perhaps Schema should also hold the default value for each field that can be during during RecordPage.format()
 class Schema:
-    """Maintains a dict capturing column info {field_name:{field_type, field_byte_length}}"""
+    """
+    Maintains a dict capturing column info {field_name:{field_type, field_byte_length}}
+    Note: This class does not add 4 bytes to the length of string data type to store the length.
+    """
 
     def __init__(self, *field_data):
         self.field_info = {}
@@ -33,9 +40,14 @@ class Schema:
 # Layout hold record's field and slot side; field offset within a slot
 class Layout:
     """
-    Calculates field offset + slot size from table schema.
-    Since our records of fixed size, slot size works as Record Identifier.
-    For variable length record we need to use an ID table.
+    This class contains self.schema, self.offset and self.slot_size
+
+    Calculates field offset from provided schema
+    slot size = status flag + field offset
+    For fixed length records, slot size is used to move from one record to another
+    For variable length record we need to use an ID table. (Fig 6.8)
+
+    Precalculate offset and slot_size can be passed to avoid rebuilding them.
     """
 
     def __init__(self, schema, offset = None, slot_size = None):
@@ -62,7 +74,7 @@ class Layout:
 # file is a sequence of blocks
 # record files are a sequence of record pages/blocks
 # record page contains sequence of slots
-# slot are one empty(0)/full(1) indicator byte + record
+# slot contains status flag(0 for empty and 1 for full) + combined field length
 
 # Record Page, Record Manager, class is responsible for interpreting the values in a record blocks/page.
 # RM uses Layout(slot size) and Schema(record info) class to update record page
@@ -73,7 +85,12 @@ class Layout:
 # beforeFirst -> firstRecord; move current_slot_index to -1
 # insertAfter -> nextEmpty; move
 class RecordPage: # Also called Record Manager in the Book
-    """Writes record data to a table block using layout"""
+    """
+    Record page writes to buffers in buffer pool using a transaction.
+    This class uses schema + layout object to find field offset(of a record) and uses tx object write to those offset.
+
+    RecordPgae.setInt(slot_number, field_name, field_value)
+    """
     def __init__(self, tx, blk, layout):
         self.tx: Transaction = tx
         self.blk: Block = blk
@@ -81,6 +98,9 @@ class RecordPage: # Also called Record Manager in the Book
         self.tx.pin(blk) # TODO: Are we pinning here to ensure tx.get/set does not fail?
 
     def setInt(self, slot_index, field_name, field_value):
+        """
+        Use the tx to update the field of a record. Record the old value of the field in log.
+        """
         blk_offset = (self.layout.slot_size * slot_index) + self.layout.offset[field_name]
         self.tx.setInt(self.blk, blk_offset, field_value, True)
 
@@ -96,29 +116,37 @@ class RecordPage: # Also called Record Manager in the Book
         blk_offset = (slot_index * self.layout.slot_size) + self.layout.offset[field_name]
         return self.tx.getString(self.blk, blk_offset)
 
-    # Mark the slot empty; we are not operating per field, so field parameter is not needed
+    # Mark the slot status field empty
+    # TODO: Do we also need to clean the fields? How does undo interacts with slots that are marked empty?
     def delete(self, slot_index):
-        self.tx.setInt(self.blk, slot_index * self.layout.slot_size, 0, True)
+        self.tx.setInt(self.blk, slot_index * self.layout.slot_size, 0, True) # slot status (0 for empty and 1 for full)
 
     # Zero our all records in the record page
     def format(self):
         db_logger.info('Format')
         slot_index = 0
-        while ((slot_index * self.layout.slot_size) + self.layout.slot_size) < self.tx.fm.block_size:
-            self.tx.setInt(self.blk, slot_index * self.layout.slot_size, 0, False)
+        while ((slot_index * self.layout.slot_size) + self.layout.slot_size) < self.tx.fm.block_size: # Check if there room for the next slot?
+            self.tx.setInt(self.blk, slot_index * self.layout.slot_size, 0, False) # Set the slot status field 0 for empty
             for field_name in self.layout.schema.getFields():
                 if self.layout.schema.field_info[field_name]['field_type'] == 'int':
                     self.tx.setInt(self.blk, slot_index * self.layout.slot_size + self.layout.offset[field_name], 0, False)
                 else:
-                    self.tx.setString(self.blk, slot_index * self.layout.slot_size + self.layout.offset[field_name], '', False) # TODO: If we are not putting anything then recovery doesn't know what to do
+                    # TODO: If we are not putting anything then recovery doesn't know what to do - why can't we just read the byte array in that range and put it in log?
+                    self.tx.setString(self.blk, slot_index * self.layout.slot_size + self.layout.offset[field_name], bytearray(self.layout.schema.field_info[field_name]['field_byte_length']).decode(), False)
             slot_index += 1
         db_logger.info('Formatted')
 
+    # Facade function for insertAfter
     def nextEmpty(self, current_slot_index):
+        """
+        Returns the slot index of the next empty slot from current_slot_index in the current record page. If none found, return -1.
+
+        This function excluded passed current_slot_index. Therefore use inserAfter(-1) to have this function return 0 for a newly formatted record page.
+        """
         return self.insertAfter(current_slot_index)
 
-    # next empty slot index with empty flag set to 0
-    def insertAfter(self, slot_index):
+    # next empty slot index with status flag set to empty(0)
+    def insertAfter(self, slot_index): # Book
         slot_index += 1
         while ((slot_index * self.layout.slot_size) + self.layout.slot_size) <= self.tx.fm.block_size:
             if not self.tx.getInt(self.blk, slot_index * self.layout.slot_size):
@@ -127,11 +155,17 @@ class RecordPage: # Also called Record Manager in the Book
             slot_index += 1
         return -1
 
+    # Facade function for nextAfter
     def nextUsed(self, current_slot_index):
+        """
+        Returns the slot index of the next full slot from current_slot_index in the current record page. If none found, return -1.
+
+        This function excludes passed current_slot_index. Therefore use nextUsed(-1) to start search from the beginning of the record page.
+        """
         return self.nextAfter(current_slot_index)
 
-    # next used slot index with empty flag set to 1
-    def nextAfter(self, slot_index):
+    # next used slot index with status flag set to full(1)
+    def nextAfter(self, slot_index): # Book
         slot_index += 1
         while ((slot_index * self.layout.slot_size) + self.layout.slot_size) <= self.tx.fm.block_size:
             if self.tx.getInt(self.blk, slot_index * self.layout.slot_size):
@@ -149,7 +183,7 @@ class RecordID:
     def __eq__(self, other):
         return self.blk_num == other.blk_num and self.slot_num == other.slot_num
 
-    def __str__(self):
+    def __repr__(self):
         return "[block numer: " + str(self.blk_num) + ", slot number: " + str(self.slot_num) + "]"
 
 
@@ -165,36 +199,49 @@ class RecordID:
 # Each record in a file can be identified by block number and slot number, these two combined is called RecordID
 # next() moves the cursor forward; it also moves to the next block if there is no more record in the current block
 class TableScan:
-    """Access table file using the layout information"""
+    """
+    TableScan, like an iterator, maintains a cursor to a particular record in the table file,
+        reads one block at a time from a table file,
+        maintains the block as a record page, and
+        provides convenient function to read/write record to table file.
+    Keeps the current block in a RecordPage to easily write to it.
+
+    RecordPgae.setInt(slot_number, field_name, field_value)
+    TabelScane.steInt(field_name, field_value)
+    """
 
     def __init__(self, tx, table_name, layout):
-        """Open tbl_name file and read records at cursor"""
-        self.tx = tx
+        """
+        Open tbl_name file and read records at cursor.
+
+        After init slot_index points to -1, and that needs to move to an actual record/slot index before reading/writing.
+        """
+        self.tx: Transaction = tx
         self.table_name = table_name
         self.file_name = self.table_name + '.tbl'
-        self.layout = layout
+        self.layout: Layout = layout
 
         self.current_slot_index = -1 # TODO: Book is initializing this value to zero.
         self.rp: RecordPage = None
-        if self.tx.size(self.file_name):
+        if self.tx.size(self.file_name) > 0:
             self.moveToBlock(0)
         else:
             # table file does not exist
             self.moveToNewBlock()
 
+    def moveToBlock(self, block_num):
+        if self.rp is not None:
+            self.tx.unpin(self.rp.blk)
+        new_blk = Block(self.file_name, block_num)
+        self.rp = RecordPage(self.tx, new_blk, self.layout)
+        self.current_slot_index = -1
+
     def moveToNewBlock(self):
-        if self.rp:
+        if self.rp is not None:
             self.tx.unpin(self.rp.blk)
         new_blk = self.tx.append(self.file_name)
         self.rp = RecordPage(self.tx, new_blk, self.layout) # tx.pin(rp.blk) happening in RecordPage constructor
         self.rp.format()
-        self.current_slot_index = -1
-
-    def moveToBlock(self, block_num):
-        if self.rp:
-            self.tx.unpin(self.rp.blk)
-        new_blk = Block(self.file_name, block_num)
-        self.rp = RecordPage(self.tx, new_blk, self.layout)
         self.current_slot_index = -1
 
     # current_slot movement
@@ -236,6 +283,7 @@ class TableScan:
     def moveToRecordID(self, rid : RecordID):
         self.moveToBlock(rid.blk_num)
         self.current_slot_index = rid.slot_num
+
 
     # operate on the current_slot_index
     def getInt(self, field_name):
@@ -326,7 +374,7 @@ if __name__ == '__main__':
         bm: BufferMgr = BufferMgr(fm, lm, 8)
 
         tx: Transaction = Transaction(fm, lm, bm)
-        blk: Block = tx.append('testfile')
+        blk: Block = tx.append('testfile') # File doesn't exist; so make an empty file first and then append and empty block to it
         tx.pin(blk)
         sch: Schema = Schema()
         sch.addField('A', 'int', 4)
@@ -335,6 +383,7 @@ if __name__ == '__main__':
         rp: RecordPage = RecordPage(tx, blk, layout)
         rp.format()
 
+        # populate the record page with some value
         print("RecordPage init")
         rand_val = [49, 34, 40, 30, 1, 17, 18, 45, 27, 5, 7, 27, 43, 9, 31, 21, 2, 2, 28, 16, 44, 3, 14, 44, 47, 41, 22, 0,
                     23, 42, 3, 25, 3, 50, 29, 35, 28, 45, 50, 6, 49, 30, 18, 16, 42, 6, 8, 45, 11, 31]
@@ -348,6 +397,7 @@ if __name__ == '__main__':
             print('Insert slot ' + str(next_empty_slot) + ' [' + str(rec_val) + ', rec' + str(rec_val) + ']')
             next_empty_slot = rp.insertAfter(next_empty_slot)
 
+        # delete some records
         print("RecordPage deletion")
         next_used_slot = rp.nextAfter(-1)
         del_counter = 0
@@ -360,6 +410,7 @@ if __name__ == '__main__':
                 print('Deleting slot ' + str(next_used_slot) + ' [' + str(a) + ',' + str(b) + ']')
             next_used_slot = rp.nextAfter(next_used_slot)
 
+        # Print the record page, print the records that were not deleted
         print("RecordPage Retained")
         next_empty_slot = rp.nextAfter(-1)
         while next_empty_slot >= 0:
@@ -380,6 +431,7 @@ if __name__ == '__main__':
         sch.addField('deptid', 'int', 4)
 
         layout = Layout(sch)
+        # 4 byte for flag; 4 byte for cid; 24 byte for title; 4 byte for deptid = 36 byte
         print(layout)
         # for k, v in layout.schema.field_info.items():
         #     print(k, v['field_byte_length'], layout.offset[k])

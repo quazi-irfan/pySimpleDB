@@ -2,11 +2,19 @@
 # https://www.amazon.com/Transaction-Processing-Concepts-Techniques-Management/dp/1558601902
 # https://www.amazon.com/Concurrency-Control-Recovery-Database-Systems/dp/0201107155
 # https://www.cs.purdue.edu/homes/bb/cs542-06Spr-bb/SCDU-Papa-79.pdf
+# https://www.amazon.com/Transactional-Information-Systems-Algorithms-Concurrency/dp/1558605088
 
 from BufferPool import *
 import time
 import logging
 db_logger = logging.getLogger('SimpleDB')
+
+# TODO: Add undo block append
+# <ADDBLK testfile>; block number is not needed since we are always adding/removing from the end of the file
+# Add block: Add appendBlock in rm that write to log file using LogRecord.writeToLog
+# rm.appendBlock will be called from tx.appendBlock
+# Remove block: Add remove/removeBlock method to Transaction that will call to FileSystem.removeBlock
+# LogRecord.undo need another condition that call to Transaction.remove/removeBlock
 
 # Original MVCC Paper https://dl.acm.org/doi/abs/10.1145/356842.356846
 # TODO: MVCC implementation; Read only tx can see

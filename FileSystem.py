@@ -4,6 +4,13 @@ import logging
 import math
 db_logger = logging.getLogger('SimpleDB')
 
+# hexdump -C testfile Each line contains 16 bytes; each group of represents 1 byte
+# A 4 byte int will take up 00 00 00 00
+# int value 4 will be encoded as 00 00 00 04
+# int value 10 will be encoded as 00 00 00 0a
+# int value -1 will be encoded as ff ff ff ff
+
+# cmp -l bin1 bin2 to compare two binary files
 # file system allows accessing raw disk in blocks.
 # in db, each file is treated like a raw disk
 # db access each file by virtual blocks(OR translates these blocks into physical blocks using file system)
@@ -76,15 +83,22 @@ class Page:
         x = bytearray(5)
         x[2:10] = b'abcefabcd'
         len(x) # 11
+
+        (0).to_bytes(4, byteorder='big', signed=True)               b'\x00\x00\x00\x00'
+        ...                                                         ...
+        (2147483647).to_bytes(4, byteorder='big', signed=True)      b'\x7f\xff\xff\xff'  (little endian b'\x7f\xff\xff\xff')
+        (-2147483648).to_bytes(4, byteorder='big', signed=True)     b'\x80\x00\x00\x00'
+        ...                                                         ...
+        (-1).to_bytes(4, byteorder='big', signed=True)              b'\xff\xff\xff\xff'
         """
         if isinstance(data, int):
-            data_bin = data.to_bytes(4,'big')  # chosing to convert integer to 4 bytes in big endian, which is the same way we write and read numbers
+            data_bin = data.to_bytes(4,byteorder='big', signed=True)  # choosing to convert integer to 4 bytes in big endian, which is the same way we write and read numbers
         elif isinstance(data, str):  # for type str
             data_bin = data.encode('utf-8')
-            data_bin_len = int.to_bytes(len(data_bin), 4,'big')  # size in byte is the same as the length of the string because I am hoping the string content will fall into ascii range
+            data_bin_len = int.to_bytes(len(data_bin), 4,byteorder='big', signed=True)  # size in byte is the same as the length of the string because I am hoping the string content will fall into ascii range
             data_bin = data_bin_len + data_bin
         else:  # TODO: Is else always expecting bytearray?
-            data_bin_len = int.to_bytes(len(data), 4, 'big')
+            data_bin_len = int.to_bytes(len(data), 4, byteorder='big', signed=True)
             data_bin = data_bin_len + data
 
         data_len = len(data_bin)
@@ -97,9 +111,10 @@ class Page:
         return self.bb[start + 4: start + 4 + str_len].decode()
 
     def getInt(self, start):
-        return int.from_bytes(self.bb[start: start + 4], 'big') # TODO When reading string/bytes length signed=False needs to be set
+        return int.from_bytes(self.bb[start: start + 4], byteorder='big', signed=True) # TODO When reading string/bytes length signed=False needs to be set
 
     def getByte(self, start):
+        """I think only log manager reads and write raw bytes"""
         byte_len = self.getInt(start)
         return self.bb[start + 4: start + 4 + byte_len]
 
@@ -116,12 +131,12 @@ class FileMgr:
     """
     # https://stackoverflow.com/questions/1466000/difference-between-modes-a-a-w-w-and-r-in-built-in-open-function
     def __init__(self, db_name, block_size):
-        import os
-        self.db_exists = os.path.isdir(db_name)
+        self.db_name = db_name
+        self.db_exists = os.path.isdir(self.db_name)
         if not self.db_exists:
-            os.mkdir(os.getcwd() + '/' + db_name)
+            os.mkdir(os.getcwd() + '/' + self.db_name)
 
-        os.chdir(os.getcwd() + '/' + db_name)
+        os.chdir(os.getcwd() + '/' + self.db_name)
 
         self._fileHandles = {}
         self.block_size = block_size
@@ -138,10 +153,11 @@ class FileMgr:
             # (I think I am emulating the Java version with this if statement here)
             # if we are reading 10th block of an empty file; we return a zeroed out page
             file_content = bytearray(f.read(self.block_size))
-            if file_content:
-                page.bb = file_content
-            else:
-                page.bb = bytearray(self.block_size)
+            #TODO: find out why this conditional statement was introduced? Current setup follows the book.
+            # if file_content:
+            page.bb = file_content
+            # else:
+            #     page.bb = bytearray(self.block_size)
 
     # if file does not exist we create a new one
     def writePageToBlock(self, block, page):
@@ -162,7 +178,9 @@ class FileMgr:
         return Block(fileName, new_block_number)
 
     def removeBlock(self, fileName, block):
-        """TODO: since append happen at the end of file, remove will happen at the end of file as well"""
+        """
+        Call this function form tx.remove/removeBlock
+        """
         pass
 
     def length(self, file_name):
@@ -172,8 +190,9 @@ class FileMgr:
 
     def getFileHandle(self, file_name):
         if file_name not in self._fileHandles:
-            open(file_name, 'wb', buffering=0).close()
-            self._fileHandles[file_name] = open(file_name, 'r+b', buffering=0) # Allow 0 byte to buffer
+            if not os.path.exists(file_name):
+                open(file_name, 'wb', buffering=0).close()
+            self._fileHandles[file_name] = open(file_name, 'r+b', buffering=0) # Disable buffering
         return self._fileHandles[file_name]
 
 # 3.12 Testing file manager
